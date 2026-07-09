@@ -3,8 +3,7 @@ SVD compression baseline for 3D simulation data.
 
 Computes a truncated SVD on non-overlapping 3D patches extracted from a single
 HDF5 snapshot.  Sweeps over a range of k (number of SVD components) and
-reports the same metrics as the LCA pipeline (rel_err, comp_ratio, BPV, PSNR),
-enabling direct comparison.
+reports rel_err, comp_ratio, BPV, and PSNR for each.
 
 No gradient descent — SVD is computed analytically from the data in one pass.
 
@@ -14,31 +13,35 @@ Compression model (per patch)
                coefficients = x_norm @ Vt.T   shape: (k,)
   - Decoder  : reconstruct from coefficients + undo normalisation
                x_norm_hat = coefficients @ Vt  → x_hat = x_norm_hat * std + mean
-  - Storage  : k × float32 = k × 4 bytes  (no index overhead, unlike COO LCA)
+  - Storage  : k × float32 = k × 4 bytes
   - Basis Vt : k × P³ × 4 bytes total, amortised over all patches in the volume
 
-Compression metrics reported:
-  comp_coeff    = (P³ × 4) / (k × 4) = P³ / k          ← coefficients only, 4 bytes each
-  comp_lca_equiv = (P³ × 4) / (k × bytes_per_coo)       ← same COO formula as LCA's comp_ratio
-    bytes_per_coo = 4 + ceil(ceil(log2(k+1)) / 8)          (float32 value + packed flat index)
-  comp_total    = (P³ × 4) / (k×4 + k×P³×4/n_patches)  ← amortised basis included
+Compression metrics reported (first sweep, exact float32 coefficients):
+  comp_coeff = (P³ × 4) / (k × 4) = P³ / k             ← coefficients only, 4 bytes each
+  comp_total = (P³ × 4) / (k×4 + k×P³×4/n_patches)     ← amortised basis included
 
-comp_lca_equiv is directly comparable to LCA's comp_ratio: both exclude model overhead and use
-the same COO byte-counting formula.  Residual differences reflect (a) SVD stores all k
-coefficients (no sparsity) while LCA stores only avg_active non-zeros, and (b) SVD's index
-range is k (small) vs LCA's n_code_patch = features × (P//stride)³ (large → higher index cost).
+These never touch a real compressor — they're a byte count of "if we kept k raw
+float32 numbers per patch." A second sweep makes the comparison to a real codec
+(e.g. bmshj2018_compression.py's actual arithmetic-coded bytes) fair: for every
+(k, bits) pair, coefficients are quantized to `bits`-bit integers (per-component
+scale) and the whole volume's coefficient matrix is losslessly entropy-coded with
+a real compressor (best of zlib/lzma, round-trip verified) — real_comp_ratio and
+real_bpv come from that measured byte count, not an analytical formula. rel_err
+here reflects both truncation (k) and quantization (bits) error.
 
 Usage
 -----
-    python svd_compression.py config_svd_lca.yaml
-    python svd_compression.py config_svd_lca.yaml --k-max 60
-    python svd_compression.py config_svd_lca.yaml --k-values 5 10 20 50
-    python svd_compression.py config_svd_lca.yaml --lca-bpv 3.5 --lca-rel-err 0.0098
-    python svd_compression.py config_svd_lca.yaml --output-dir results/svd_run1
+    python svd_compression.py config_simmldc.yaml
+    python svd_compression.py config_simmldc.yaml --k-max 60
+    python svd_compression.py config_simmldc.yaml --k-values 5 10 20 50
+    python svd_compression.py config_simmldc.yaml --quant-bits 4 8 12 16
+    python svd_compression.py config_simmldc.yaml --output-dir results/svd_run1
 """
 
 import argparse
+import lzma
 import os
+import zlib
 from datetime import datetime
 
 import h5py
@@ -147,16 +150,6 @@ def compute_metrics(
     comp_total     = bytes_in / bytes_total if bytes_total > 0 else float('inf')
     bpv_total      = (bytes_total * 8) / P3
 
-    # LCA-equivalent metric: same COO sparse-storage formula as lca_sim_mldc_SingleSnaptshot.py
-    #   _bytes_per_nz = 4 + (_index_bits + 7) // 8
-    # Applied to SVD's k dense ordered coefficients; index range = [0, k) so index cost
-    # is much smaller than LCA's (k << features × (P//stride)³).
-    _index_bits_svd = int(np.ceil(np.log2(k + 1))) if k > 1 else 1
-    _bytes_per_coo  = 4 + (_index_bits_svd + 7) // 8
-    _bytes_code_coo = k * _bytes_per_coo
-    comp_lca_equiv  = bytes_in / _bytes_code_coo if _bytes_code_coo > 0 else float('inf')
-    bpv_lca_equiv   = (_bytes_code_coo * 8) / P3
-
     return dict(
         k=k,
         rel_err=rel_err,
@@ -166,9 +159,95 @@ def compute_metrics(
         bpv_coeff=bpv_coeff,
         comp_total=comp_total,
         bpv_total=bpv_total,
-        comp_lca_equiv=comp_lca_equiv,
-        bpv_lca_equiv=bpv_lca_equiv,
     )
+
+
+# ---------------------------------------------------------------------------
+# Real quantization + entropy coding (comparable to a real "bytes on disk" codec)
+# ---------------------------------------------------------------------------
+
+def quantize_coeffs(coeffs_k: np.ndarray, col_scale_k: np.ndarray, bits: int):
+    """
+    Per-column uniform scalar quantization of SVD coefficients.
+
+    Each retained component (column) gets its own scale, since singular values
+    (and hence coefficient magnitudes) decay sharply across components —
+    matching standard practice (e.g. JPEG's per-frequency quantization tables).
+
+    Returns
+    -------
+    q       : integer symbols, dtype sized to `bits` (int8/int16/int32)
+    dequant : float32 reconstruction of `coeffs_k` after quantization (lossy)
+    """
+    levels = 2 ** bits
+    qmax = levels // 2 - 1
+    dtype = np.int8 if bits <= 8 else (np.int16 if bits <= 16 else np.int32)
+    scale = np.where(col_scale_k > 0, col_scale_k, 1.0)
+    q = np.round(coeffs_k / scale * qmax).clip(-qmax, qmax).astype(dtype)
+    dequant = q.astype(np.float32) * scale / qmax
+    return q, dequant
+
+
+def real_compress_bytes(q: np.ndarray) -> int:
+    """
+    Real, lossless entropy coding of quantized integer symbols — the best of
+    zlib and lzma — with a round-trip check, so this is a genuinely measured
+    "bytes on disk" size, not an estimate.
+    """
+    raw = q.tobytes()
+    zlib_bytes = zlib.compress(raw, level=9)
+    lzma_bytes = lzma.compress(raw, preset=9)
+    if len(zlib_bytes) <= len(lzma_bytes):
+        assert zlib.decompress(zlib_bytes) == raw, "real entropy coding round-trip failed"
+        return len(zlib_bytes)
+    assert lzma.decompress(lzma_bytes) == raw, "real entropy coding round-trip failed"
+    return len(lzma_bytes)
+
+
+def compute_real_metrics(
+    input_vol: np.ndarray,
+    recon_vol: np.ndarray,
+    k: int,
+    bits: int,
+    real_bytes: int,
+    n_patches: int,
+    patch_size: int,
+) -> dict:
+    """Same rel_err/PSNR formulas as compute_metrics, but comp_ratio/BPV come from a
+    real measured compressed byte count for the whole volume's coefficient matrix,
+    not an analytical byte-counting formula."""
+    error     = input_vol - recon_vol
+    mse       = float((error**2).mean())
+    rmse      = float(np.sqrt(mse))
+    rel_err   = float(np.sqrt(mse) / (np.sqrt((input_vol**2).mean()) + 1e-8))
+    sig_range = float(input_vol.max() - input_vol.min())
+    psnr      = float(20 * np.log10(sig_range / (rmse + 1e-12)))
+
+    bytes_in        = n_patches * patch_size**3 * 4   # whole covered volume, float32 baseline
+    real_comp_ratio = bytes_in / real_bytes if real_bytes > 0 else float('inf')
+    real_bpv        = (real_bytes * 8) / (n_patches * patch_size**3)
+
+    return dict(
+        k=k,
+        bits=bits,
+        rel_err=rel_err,
+        psnr=psnr,
+        real_bytes=real_bytes,
+        real_comp_ratio=real_comp_ratio,
+        real_bpv=real_bpv,
+    )
+
+
+def pareto_frontier(points: list) -> list:
+    """Given (rel_err, bpv, ...) tuples, return the rate-distortion frontier:
+    for increasing rel_err, the entries where bpv reaches a new minimum."""
+    frontier = []
+    best_bpv = float('inf')
+    for p in sorted(points, key=lambda p: p[0]):
+        if p[1] < best_bpv:
+            frontier.append(p)
+            best_bpv = p[1]
+    return frontier
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +261,8 @@ def main():
                         help='specific k values to evaluate (default: auto)')
     parser.add_argument('--k-max', type=int, default=None,
                         help='maximum k to sweep (default: n_patches)')
-    parser.add_argument('--lca-bpv', type=float, default=None,
-                        help='LCA BPV result for comparison line on plots')
-    parser.add_argument('--lca-rel-err', type=float, default=None,
-                        help='LCA relative error result for comparison line on plots')
+    parser.add_argument('--quant-bits', type=int, nargs='+', default=[4, 6, 8, 10, 12, 16],
+                        help='bit-depths to sweep for the real quantization + entropy-coding pass')
     parser.add_argument('--output-dir', default=None,
                         help='output directory (default: experiments/svd_TIMESTAMP)')
     args = parser.parse_args()
@@ -288,9 +365,8 @@ def main():
     results = []
     print(f"{'k':>6}  {'rel_err':>10}  {'PSNR(dB)':>10}  "
           f"{'Comp(coeff)':>13}  {'BPV(coeff)':>12}  "
-          f"{'Comp(+basis)':>14}  {'BPV(+basis)':>13}  "
-          f"{'Comp(LCA-eq)':>14}  {'BPV(LCA-eq)':>13}")
-    print('-' * 118)
+          f"{'Comp(+basis)':>14}  {'BPV(+basis)':>13}")
+    print('-' * 90)
 
     for k in k_values:
         coeffs_k = coeffs_full[:, :k]           # (n_patches, k)
@@ -303,8 +379,7 @@ def main():
         results.append(m)
         print(f"{k:>6}  {m['rel_err']:>10.6f}  {m['psnr']:>10.2f}  "
               f"{m['comp_coeff']:>13.2f}x  {m['bpv_coeff']:>12.3f}  "
-              f"{m['comp_total']:>14.2f}x  {m['bpv_total']:>13.3f}  "
-              f"{m['comp_lca_equiv']:>14.2f}x  {m['bpv_lca_equiv']:>13.3f}")
+              f"{m['comp_total']:>14.2f}x  {m['bpv_total']:>13.3f}")
 
     print()
 
@@ -313,13 +388,66 @@ def main():
     if under_1pct:
         best = max(under_1pct, key=lambda r: r['comp_coeff'])
         print(f"Best (rel_err ≤ 1%): k={best['k']}  rel_err={best['rel_err']:.4f}  "
-              f"comp(coeff)={best['comp_coeff']:.2f}x  BPV(coeff)={best['bpv_coeff']:.3f}  "
-              f"comp(LCA-eq)={best['comp_lca_equiv']:.2f}x  BPV(LCA-eq)={best['bpv_lca_equiv']:.3f}")
+              f"comp(coeff)={best['comp_coeff']:.2f}x  BPV(coeff)={best['bpv_coeff']:.3f}")
     else:
         best = min(results, key=lambda r: r['rel_err'])
         print(f"Note: rel_err never reaches 1% — "
               f"best is k={best['k']}  rel_err={best['rel_err']:.4f}  "
-              f"comp(LCA-eq)={best['comp_lca_equiv']:.2f}x  BPV(LCA-eq)={best['bpv_lca_equiv']:.3f}")
+              f"comp(coeff)={best['comp_coeff']:.2f}x  BPV(coeff)={best['bpv_coeff']:.3f}")
+
+    # ------------------------------------------------------------------ #
+    # Real quantization + entropy-coding sweep (k × bits)
+    #
+    # The sweep above counts coefficients as raw, unquantized float32 — never
+    # actually compressed. This sweep quantizes each retained component
+    # (per-column scale) to `bits`-bit integers and entropy-codes the whole
+    # volume's coefficient matrix with a real, round-trip-verified compressor
+    # (zlib/lzma), giving a genuinely measured "bytes on disk" size —
+    # comparable to bmshj2018_compression.py's real coded-byte count.
+    # ------------------------------------------------------------------ #
+    col_scale = np.abs(coeffs_full).max(axis=0)   # (k_max,) per-component scale
+
+    n_combos = len(k_values) * len(args.quant_bits)
+    print(f"\nReal quantization + entropy coding sweep "
+          f"(k × bits, {len(k_values)}×{len(args.quant_bits)} = {n_combos} combos) ...")
+    print(f"{'k':>6}  {'bits':>5}  {'rel_err':>10}  {'PSNR(dB)':>10}  "
+          f"{'RealComp':>10}  {'RealBPV':>9}  {'RealBytes':>12}")
+    print('-' * 72)
+
+    real_results = []
+    for k in k_values:
+        col_scale_k = col_scale[:k]
+        Vt_k = Vt[:k]
+        for bits in args.quant_bits:
+            q, dequant = quantize_coeffs(coeffs_full[:, :k], col_scale_k, bits)
+            real_bytes = real_compress_bytes(q)
+            recon_vol_q = reconstruct_volume(
+                dequant, Vt_k, means, stds, positions,
+                (D_out, H_out, W_out), P
+            )
+            rm = compute_real_metrics(input_vol, recon_vol_q, k, bits, real_bytes, n_patches, P)
+            real_results.append(rm)
+            print(f"{k:>6}  {bits:>5}  {rm['rel_err']:>10.6f}  {rm['psnr']:>10.2f}  "
+                  f"{rm['real_comp_ratio']:>9.2f}x  {rm['real_bpv']:>9.4f}  {rm['real_bytes']:>12,}")
+
+    print()
+
+    frontier = pareto_frontier([(r['rel_err'], r['real_bpv'], r) for r in real_results])
+    frontier_rel_errs = [p[0] for p in frontier]
+    frontier_bpvs     = [p[1] for p in frontier]
+    frontier_best     = min(frontier, key=lambda p: p[0])[2]  # frontier point closest to 0 rel_err
+
+    real_under_1pct = [p for p in frontier if p[0] <= 0.01]
+    if real_under_1pct:
+        real_best = min(real_under_1pct, key=lambda p: p[1])[2]  # lowest bpv among those under 1%
+        print(f"Best real (rel_err ≤ 1%): k={real_best['k']}  bits={real_best['bits']}  "
+              f"rel_err={real_best['rel_err']:.4f}  "
+              f"comp={real_best['real_comp_ratio']:.2f}x  BPV={real_best['real_bpv']:.4f}")
+    else:
+        print(f"Note: real rel_err never reaches 1% — "
+              f"best is k={frontier_best['k']}  bits={frontier_best['bits']}  "
+              f"rel_err={frontier_best['rel_err']:.4f}  "
+              f"comp={frontier_best['real_comp_ratio']:.2f}x  BPV={frontier_best['real_bpv']:.4f}")
 
     # ------------------------------------------------------------------ #
     # Plot 1 — Singular value spectrum
@@ -371,9 +499,6 @@ def main():
     ax2.plot(ks, comps, 's--', color='darkorange', markersize=4, label='comp_ratio (coeff)')
 
     ax1.axhline(0.01, color='red', linestyle=':', linewidth=1, label='1% target')
-    if args.lca_rel_err is not None:
-        ax1.axhline(args.lca_rel_err, color='purple', linestyle='--', linewidth=1,
-                    label=f'LCA rel_err={args.lca_rel_err:.4f}')
 
     ax1.set_xlabel('k (SVD components)')
     ax1.set_ylabel('Relative reconstruction error (log)', color='steelblue')
@@ -398,15 +523,8 @@ def main():
                 label='SVD (coeff only, 4 B/coeff)')
     ax.semilogy([r['bpv_total'] for r in results], rel_errs, 's--',
                 color='teal', markersize=4, alpha=0.7, label='SVD (+ amortised basis)')
-    ax.semilogy([r['bpv_lca_equiv'] for r in results], rel_errs, '^:',
-                color='darkorange', markersize=4, alpha=0.9, label='SVD (LCA-equiv COO storage)')
 
     ax.axhline(0.01, color='red', linestyle=':', linewidth=1, label='1% error target')
-
-    if args.lca_bpv is not None and args.lca_rel_err is not None:
-        ax.scatter([args.lca_bpv], [args.lca_rel_err], marker='*', s=200,
-                   color='red', zorder=5, label=f'LCA ({args.lca_bpv:.2f} BPV, '
-                                                  f'{args.lca_rel_err:.4f} err)')
 
     # Annotate some k values
     for r in results[::max(1, len(results)//8)]:
@@ -420,6 +538,31 @@ def main():
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     out = os.path.join(plots_dir, 'rate_distortion.png')
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+    # ------------------------------------------------------------------ #
+    # Plot 3b — Real quantization + entropy-coding rate-distortion
+    # ------------------------------------------------------------------ #
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.semilogy(bpvs, rel_errs, 'o-', color='steelblue', markersize=4, alpha=0.5,
+                label='SVD (raw float32 coeffs, no quantization)')
+    ax.scatter([r['real_bpv'] for r in real_results], [r['rel_err'] for r in real_results],
+               s=12, color='lightgray', alpha=0.6, zorder=2,
+               label='SVD (quantized + real-compressed, all k×bits)')
+    ax.semilogy(frontier_bpvs, frontier_rel_errs, 's-', color='darkorange', markersize=5,
+                zorder=3, label='SVD (quantized + real-compressed, Pareto frontier)')
+
+    ax.axhline(0.01, color='red', linestyle=':', linewidth=1, label='1% error target')
+
+    ax.set_xlabel('Bits per voxel (BPV)')
+    ax.set_ylabel('Relative reconstruction error (log scale)')
+    ax.set_title(f'SVD Real Rate–Distortion  |  patch {P}³  |  {n_patches} patches')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out = os.path.join(plots_dir, 'real_rate_distortion.png')
     plt.savefig(out, dpi=150)
     plt.close()
     print(f"Saved {out}")
@@ -469,34 +612,6 @@ def main():
     print(f"Saved {out}")
 
     # ------------------------------------------------------------------ #
-    # Plot 5 — Comparison: SVD error map vs LCA (if lca_rel_err provided)
-    # ------------------------------------------------------------------ #
-    if args.lca_rel_err is not None:
-        error_vol = input_vol - recon_vol
-        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-        plane_data = [
-            ('XY', input_vol[:, :, mW], error_vol[:, :, mW]),
-            ('XZ', input_vol[:, mH, :], error_vol[:, mH, :]),
-            ('YZ', input_vol[mD, :, :], error_vol[mD, :, :]),
-        ]
-        for ax, (lbl, inp_p, err_p) in zip(axes, plane_data):
-            vmax = np.percentile(np.abs(inp_p), 99)
-            ax.imshow(err_p, cmap='RdBu_r', vmin=-vmax, vmax=vmax,
-                      origin='lower', aspect='equal')
-            ax.set_title(f'SVD error  {lbl}', fontsize=9)
-            ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-        fig.suptitle(
-            f'SVD error maps  |  k={best_k}  rel_err={best["rel_err"]:.4f}  '
-            f'vs LCA rel_err={args.lca_rel_err:.4f}',
-            fontsize=9
-        )
-        plt.tight_layout()
-        out = os.path.join(plots_dir, f'error_maps_k{best_k}.png')
-        plt.savefig(out, dpi=150)
-        plt.close()
-        print(f"Saved {out}")
-
-    # ------------------------------------------------------------------ #
     # Save results table
     # ------------------------------------------------------------------ #
     import csv
@@ -506,6 +621,13 @@ def main():
         writer.writeheader()
         writer.writerows(results)
     print(f"\nResults table saved to {csv_path}")
+
+    real_csv_path = os.path.join(out_dir, 'svd_real_results.csv')
+    with open(real_csv_path, 'w', newline='') as csvf:
+        writer = csv.DictWriter(csvf, fieldnames=real_results[0].keys())
+        writer.writeheader()
+        writer.writerows(real_results)
+    print(f"Real-compression results table saved to {real_csv_path}")
 
     print(f"\n{'='*60}")
     print(f"SVD SUMMARY  (patch {P}³, {n_patches} tiles, t={dcfg['timestep']})")
@@ -519,10 +641,10 @@ def main():
     print(f"k for 99% variance:         {k99}  →  comp={P**3/k99:.1f}x  BPV={k99*32/P**3:.3f}")
     if under_1pct:
         print(f"Best (rel_err ≤ 1%):        k={best['k']}  "
-              f"comp(coeff)={best['comp_coeff']:.2f}x  BPV={best['bpv_coeff']:.3f}  "
-              f"comp(LCA-eq)={best['comp_lca_equiv']:.2f}x  BPV(LCA-eq)={best['bpv_lca_equiv']:.3f}")
-    if args.lca_bpv:
-        print(f"LCA reference:              BPV={args.lca_bpv:.3f}  rel_err={args.lca_rel_err}")
+              f"comp(coeff)={best['comp_coeff']:.2f}x  BPV={best['bpv_coeff']:.3f}")
+    if real_under_1pct:
+        print(f"Best real (rel_err ≤ 1%):   k={real_best['k']}  bits={real_best['bits']}  "
+              f"comp={real_best['real_comp_ratio']:.2f}x  BPV={real_best['real_bpv']:.4f}")
 
     print("\nDone.")
     _log.close()

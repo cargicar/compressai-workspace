@@ -9,6 +9,12 @@ both CSVs, overlays their rate-distortion and compression-ratio curves, and
 prints the BPV and comp_ratio each method needs/achieves at a set of target
 relative errors so the two are easy to read off side by side.
 
+If the SVD run directory also has a `svd_real_results.csv` (from
+svd_compression.py's quantization + real entropy-coding sweep), its Pareto
+frontier is loaded too and is the fairest comparison against bmshj2018's real
+coded bytes — the plain SVD curves never touch a real compressor, they're a
+raw float32 byte count.
+
 Usage
 -----
     python compare_compression.py experiments/svd_2026-07-08_10-00-00 experiments/bmshj2018_2026-07-08_10-05-00
@@ -39,6 +45,26 @@ def load_csv(path: str) -> list:
     return [{k: float(v) for k, v in row.items()} for row in rows]
 
 
+def load_optional_sibling_csv(reference_path: str, filename: str):
+    """Look for `filename` next to `reference_path`; return rows or None if absent."""
+    candidate = os.path.join(os.path.dirname(reference_path), filename)
+    if not os.path.isfile(candidate):
+        return None
+    return load_csv(candidate)
+
+
+def pareto_frontier(points: list) -> list:
+    """Given (rel_err, bpv, ...) tuples, return the rate-distortion frontier:
+    for increasing rel_err, the entries where bpv reaches a new minimum."""
+    frontier = []
+    best_bpv = float('inf')
+    for p in sorted(points, key=lambda p: p[0]):
+        if p[1] < best_bpv:
+            frontier.append(p)
+            best_bpv = p[1]
+    return frontier
+
+
 def value_at_target(rel_errs: np.ndarray, values: np.ndarray, target: float):
     """Interpolate `values` (BPV or comp_ratio) at `target` rel_err (None if out of range)."""
     order = np.argsort(rel_errs)
@@ -65,24 +91,47 @@ def main():
     svd_rows   = sorted(load_csv(svd_path), key=lambda r: r['k'])
     bmshj_rows = sorted(load_csv(bmshj_path), key=lambda r: r['quality'])
 
-    svd_relerr   = np.array([r['rel_err']   for r in svd_rows])
-    svd_bpv      = np.array([r['bpv_coeff'] for r in svd_rows])       # raw float32 coeffs, no entropy coding
-    svd_bpv_lca  = np.array([r['bpv_lca_equiv'] for r in svd_rows])   # COO-style, for reference
-    svd_comp     = np.array([r['comp_coeff'] for r in svd_rows])      # = 32 / bpv_coeff, same baseline
+    svd_relerr   = np.array([r['rel_err']    for r in svd_rows])
+    svd_bpv      = np.array([r['bpv_coeff']  for r in svd_rows])   # raw float32 coeffs, no entropy coding
+    svd_bpv_tot  = np.array([r['bpv_total']  for r in svd_rows])   # + amortised basis cost
+    svd_comp     = np.array([r['comp_coeff'] for r in svd_rows])   # = 32 / bpv_coeff, same baseline
 
     bmshj_relerr = np.array([r['rel_err']    for r in bmshj_rows])
     bmshj_bpv    = np.array([r['bpv']        for r in bmshj_rows])    # real arithmetic-coded bytes
     bmshj_comp   = np.array([r['comp_ratio'] for r in bmshj_rows])
 
+    # Optional: SVD real quantization + entropy-coding sweep (fairest comparison, if present)
+    svd_real_rows = load_optional_sibling_csv(svd_path, 'svd_real_results.csv')
+    if svd_real_rows:
+        real_frontier  = pareto_frontier([(r['rel_err'], r['real_bpv'], r) for r in svd_real_rows])
+        svd_real_relerr = np.array([p[0] for p in real_frontier])
+        svd_real_bpv    = np.array([p[1] for p in real_frontier])
+        svd_real_comp   = np.array([p[2]['real_comp_ratio'] for p in real_frontier])
+        print("Found svd_real_results.csv — including SVD's real quantized+entropy-coded frontier.\n")
+    else:
+        svd_real_relerr = svd_real_bpv = svd_real_comp = None
+        print("No svd_real_results.csv found next to the SVD CSV — only the raw-coefficient SVD "
+              "curve is available (run svd_compression.py to get the real-compression sweep).\n")
+
+    # For the console table / winner, prefer SVD's real numbers when available — they're the
+    # fair comparison against bmshj2018's real coded bytes; the raw-coeff SVD curve never
+    # touches a compressor.
+    svd_table_relerr = svd_real_relerr if svd_real_rows else svd_relerr
+    svd_table_bpv     = svd_real_bpv    if svd_real_rows else svd_bpv
+    svd_table_comp    = svd_real_comp   if svd_real_rows else svd_comp
+    svd_table_label   = "SVD-real" if svd_real_rows else "SVD"
+
     # ------------------------------------------------------------------ #
     # Console comparison table — BPV and compression ratio side by side
     # ------------------------------------------------------------------ #
-    print(f"{'target rel_err':>15}  {'SVD BPV':>9}  {'SVD Comp':>10}  "
+    print(f"{'target rel_err':>15}  {svd_table_label+' BPV':>10}  {svd_table_label+' Comp':>11}  "
           f"{'bmshj BPV':>10}  {'bmshj Comp':>11}  {'winner (comp)':>14}")
-    print('-' * 82)
+    print('-' * 85)
     for t in sorted(args.targets):
-        svd_b, bmshj_b = value_at_target(svd_relerr, svd_bpv, t), value_at_target(bmshj_relerr, bmshj_bpv, t)
-        svd_c, bmshj_c = value_at_target(svd_relerr, svd_comp, t), value_at_target(bmshj_relerr, bmshj_comp, t)
+        svd_b   = value_at_target(svd_table_relerr, svd_table_bpv, t)
+        bmshj_b = value_at_target(bmshj_relerr, bmshj_bpv, t)
+        svd_c   = value_at_target(svd_table_relerr, svd_table_comp, t)
+        bmshj_c = value_at_target(bmshj_relerr, bmshj_comp, t)
 
         svd_b_s   = f"{svd_b:.4f}"   if svd_b   is not None else "n/a"
         bmshj_b_s = f"{bmshj_b:.4f}" if bmshj_b is not None else "n/a"
@@ -90,18 +139,23 @@ def main():
         bmshj_c_s = f"{bmshj_c:.2f}x" if bmshj_c is not None else "n/a"
 
         if svd_c is not None and bmshj_c is not None:
-            winner = "SVD" if svd_c > bmshj_c else "bmshj2018"
+            winner = svd_table_label if svd_c > bmshj_c else "bmshj2018"
         else:
             winner = "n/a"
-        print(f"{t:>15.3f}  {svd_b_s:>9}  {svd_c_s:>10}  "
+        print(f"{t:>15.3f}  {svd_b_s:>10}  {svd_c_s:>11}  "
               f"{bmshj_b_s:>10}  {bmshj_c_s:>11}  {winner:>14}")
 
     svd_best   = min(svd_rows, key=lambda r: r['rel_err'])
     bmshj_best = min(bmshj_rows, key=lambda r: r['rel_err'])
-    print(f"\nSVD best achievable:       rel_err={svd_best['rel_err']:.4f}  "
+    print(f"\nSVD best achievable (raw coeffs): rel_err={svd_best['rel_err']:.4f}  "
           f"comp_ratio={svd_best['comp_coeff']:.2f}x  BPV(coeff)={svd_best['bpv_coeff']:.4f}  "
           f"k={int(svd_best['k'])}")
-    print(f"bmshj2018 best achievable: rel_err={bmshj_best['rel_err']:.4f}  "
+    if svd_real_rows:
+        svd_real_best = min(svd_real_rows, key=lambda r: r['rel_err'])
+        print(f"SVD best achievable (real):        rel_err={svd_real_best['rel_err']:.4f}  "
+              f"comp_ratio={svd_real_best['real_comp_ratio']:.2f}x  BPV={svd_real_best['real_bpv']:.4f}  "
+              f"k={int(svd_real_best['k'])}  bits={int(svd_real_best['bits'])}")
+    print(f"bmshj2018 best achievable:         rel_err={bmshj_best['rel_err']:.4f}  "
           f"comp_ratio={bmshj_best['comp_ratio']:.2f}x  BPV={bmshj_best['bpv']:.4f}  "
           f"quality={int(bmshj_best['quality'])}")
 
@@ -109,10 +163,13 @@ def main():
     # Overlay plot
     # ------------------------------------------------------------------ #
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.semilogy(svd_bpv, svd_relerr, 'o-', color='steelblue', markersize=5,
-                label='SVD (raw float32 coeffs)')
-    ax.semilogy(svd_bpv_lca, svd_relerr, '^:', color='teal', markersize=4, alpha=0.7,
-                label='SVD (COO-style estimate)')
+    ax.semilogy(svd_bpv, svd_relerr, 'o-', color='steelblue', markersize=5, alpha=0.5,
+                label='SVD (raw float32 coeffs, not compressed)')
+    ax.semilogy(svd_bpv_tot, svd_relerr, '^:', color='teal', markersize=4, alpha=0.4,
+                label='SVD (+ amortised basis, not compressed)')
+    if svd_real_rows:
+        ax.semilogy(svd_real_bpv, svd_real_relerr, 'D-', color='seagreen', markersize=5,
+                    label='SVD (quantized + real-compressed, Pareto frontier)')
     ax.semilogy(bmshj_bpv, bmshj_relerr, 's-', color='darkorange', markersize=5,
                 label='bmshj2018-factorized (real coded bytes)')
 
@@ -139,13 +196,16 @@ def main():
     # ------------------------------------------------------------------ #
     # Compression-ratio comparison plot: comp_ratio vs rel_err
     # ------------------------------------------------------------------ #
-    svd_comp_lca = 32.0 / svd_bpv_lca  # comp_ratio = 32 / bpv, same float32-baseline convention
+    svd_comp_tot = 32.0 / svd_bpv_tot  # comp_ratio = 32 / bpv, same float32-baseline convention
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.loglog(svd_relerr, svd_comp, 'o-', color='steelblue', markersize=5,
-              label='SVD (raw float32 coeffs)')
-    ax.loglog(svd_relerr, svd_comp_lca, '^:', color='teal', markersize=4, alpha=0.7,
-              label='SVD (COO-style estimate)')
+    ax.loglog(svd_relerr, svd_comp, 'o-', color='steelblue', markersize=5, alpha=0.5,
+              label='SVD (raw float32 coeffs, not compressed)')
+    ax.loglog(svd_relerr, svd_comp_tot, '^:', color='teal', markersize=4, alpha=0.4,
+              label='SVD (+ amortised basis, not compressed)')
+    if svd_real_rows:
+        ax.loglog(svd_real_relerr, svd_real_comp, 'D-', color='seagreen', markersize=5,
+                  label='SVD (quantized + real-compressed, Pareto frontier)')
     ax.loglog(bmshj_relerr, bmshj_comp, 's-', color='darkorange', markersize=5,
               label='bmshj2018-factorized (real coded bytes)')
 
