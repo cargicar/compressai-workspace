@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Generated run outputs
+experiments/
+debugs/
+compare_rate_distortion.png
+compare_comp_ratio.png
