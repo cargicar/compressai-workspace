@@ -232,6 +232,10 @@ def main():
     for r in svd_rows[::max(1, len(svd_rows)//8)]:
         ax.annotate(f"k={int(r['k'])}", (r['bpv_coeff'], r['rel_err']),
                     textcoords='offset points', xytext=(4, 4), fontsize=7, color='steelblue')
+    if svd_real_rows:
+        for rel_err, bpv, r in real_frontier:
+            ax.annotate(f"k={int(r['k'])},b={int(r['bits'])}", (bpv, rel_err),
+                        textcoords='offset points', xytext=(4, 4), fontsize=7, color='seagreen')
     for r in bmshj_rows:
         ax.annotate(r['label'], (r['bpv'], r['rel_err']),
                     textcoords='offset points', xytext=(4, -8), fontsize=7, color='darkorange')
@@ -267,6 +271,10 @@ def main():
     for r in svd_rows[::max(1, len(svd_rows)//8)]:
         ax.annotate(f"k={int(r['k'])}", (r['rel_err'], r['comp_coeff']),
                     textcoords='offset points', xytext=(4, 4), fontsize=7, color='steelblue')
+    if svd_real_rows:
+        for rel_err, bpv, r in real_frontier:
+            ax.annotate(f"k={int(r['k'])},b={int(r['bits'])}", (rel_err, r['real_comp_ratio']),
+                        textcoords='offset points', xytext=(4, 4), fontsize=7, color='seagreen')
     for r in bmshj_rows:
         ax.annotate(r['label'], (r['rel_err'], r['comp_ratio']),
                     textcoords='offset points', xytext=(4, -8), fontsize=7, color='darkorange')

@@ -171,7 +171,6 @@ class FactorizedEntropy(nn.Module):
         for i in range(len(self.matrices)):
             matrix = F.softplus(self.matrices[i])          # non-negative weights -> monotonic
             logits = torch.matmul(matrix, logits) + self.biases[i]
-            breakpoint()
             if i < len(self.factors):
                 factor = torch.tanh(self.factors[i])
                 logits = logits + factor * torch.tanh(logits)   # monotonic nonlinearity
