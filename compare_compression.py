@@ -1,13 +1,19 @@
 """
-Compare two compression baselines (SVD and bmshj2018-factorized) on the
-same rel_err / BPV metrics.
+Compare two compression baselines (SVD and a bmshj2018-factorized model) on
+the same rel_err / BPV metrics.
 
-Both `svd_compression.py` and `bmshj2018_compression.py` already sweep a
-rate-controlling parameter (k / quality) and save a results CSV with
-comparable metrics (rel_err, PSNR, comp_ratio, BPV). This script just loads
-both CSVs, overlays their rate-distortion and compression-ratio curves, and
-prints the BPV and comp_ratio each method needs/achieves at a set of target
-relative errors so the two are easy to read off side by side.
+The bmshj2018 side can be either `bmshj2018_compression.py`'s pretrained-model
+sweep (`bmshj2018_results.csv`, swept over `quality`) or
+`bmshj2018_scratch.py`'s from-scratch run (`scratch_results.csv`, currently a
+single λ, not a sweep) — this script auto-detects which one is present in the
+given directory and normalizes both into the same rel_err/bpv/comp_ratio
+fields so the rest of the script doesn't care which one it's looking at.
+
+Both `svd_compression.py` and `bmshj2018_compression.py`/`bmshj2018_scratch.py`
+already report comparable metrics (rel_err, PSNR, comp_ratio, BPV). This script
+just loads the CSVs, overlays their rate-distortion and compression-ratio
+curves, and prints the BPV and comp_ratio each method needs/achieves at a set
+of target relative errors so they're easy to read off side by side.
 
 If the SVD run directory also has a `svd_real_results.csv` (from
 svd_compression.py's quantization + real entropy-coding sweep), its Pareto
@@ -18,6 +24,7 @@ raw float32 byte count.
 Usage
 -----
     python compare_compression.py experiments/svd_2026-07-08_10-00-00 experiments/bmshj2018_2026-07-08_10-05-00
+    python compare_compression.py experiments/svd_2026-07-08_10-00-00 experiments/scratch_poc2
     python compare_compression.py path/to/svd_results.csv path/to/bmshj2018_results.csv
     python compare_compression.py <svd_run_dir> <bmshj_run_dir> --targets 0.01 0.02 0.05 --output compare.png
 """
@@ -39,10 +46,45 @@ def resolve_csv(path: str, expected_name: str) -> str:
     return path
 
 
+def resolve_bmshj_csv(path: str):
+    """Auto-detect a pretrained (bmshj2018_results.csv) or from-scratch
+    (scratch_results.csv) results file. Returns (kind, csv_path)."""
+    if os.path.isdir(path):
+        pretrained = os.path.join(path, 'bmshj2018_results.csv')
+        scratch = os.path.join(path, 'scratch_results.csv')
+        if os.path.isfile(pretrained):
+            return 'pretrained', pretrained
+        if os.path.isfile(scratch):
+            return 'scratch', scratch
+        raise FileNotFoundError(
+            f"Expected bmshj2018_results.csv or scratch_results.csv inside {path}")
+    basename = os.path.basename(path)
+    kind = 'scratch' if basename == 'scratch_results.csv' else 'pretrained'
+    return kind, path
+
+
 def load_csv(path: str) -> list:
     with open(path, newline='') as f:
         rows = list(csv.DictReader(f))
     return [{k: float(v) for k, v in row.items()} for row in rows]
+
+
+def normalize_bmshj_rows(kind: str, rows: list) -> list:
+    """Add unified 'bpv' / 'comp_ratio' / 'label' fields regardless of source,
+    so the rest of the script doesn't need to know pretrained vs scratch."""
+    normalized = []
+    for r in rows:
+        row = dict(r)
+        if kind == 'pretrained':
+            row['bpv'] = r['bpv']
+            row['comp_ratio'] = r['comp_ratio']
+            row['label'] = f"q={int(r['quality'])}"
+        else:
+            row['bpv'] = r['real_bpv']
+            row['comp_ratio'] = r['real_comp_ratio']
+            row['label'] = f"λ={r['lambda_']:.0f}"
+        normalized.append(row)
+    return normalized
 
 
 def load_optional_sibling_csv(reference_path: str, filename: str):
@@ -75,9 +117,10 @@ def value_at_target(rel_errs: np.ndarray, values: np.ndarray, target: float):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Compare SVD vs bmshj2018-factorized results')
+    parser = argparse.ArgumentParser(description='Compare SVD vs a bmshj2018-factorized model')
     parser.add_argument('svd', help='svd_results.csv or its run directory')
-    parser.add_argument('bmshj', help='bmshj2018_results.csv or its run directory')
+    parser.add_argument('bmshj', help='bmshj2018_results.csv / scratch_results.csv or its run directory '
+                                       '(pretrained vs from-scratch auto-detected)')
     parser.add_argument('--targets', type=float, nargs='+',
                         default=[0.01, 0.02, 0.05, 0.1],
                         help='rel_err targets to compare BPV at')
@@ -85,11 +128,17 @@ def main():
                         help='output plot path')
     args = parser.parse_args()
 
-    svd_path   = resolve_csv(args.svd, 'svd_results.csv')
-    bmshj_path = resolve_csv(args.bmshj, 'bmshj2018_results.csv')
+    svd_path = resolve_csv(args.svd, 'svd_results.csv')
+    bmshj_kind, bmshj_path = resolve_bmshj_csv(args.bmshj)
+    bmshj_label_prefix = 'bmshj2018-pretrained' if bmshj_kind == 'pretrained' else 'bmshj2018-scratch'
+    print(f"bmshj2018 source: {bmshj_kind} ({bmshj_path})")
+    if bmshj_kind == 'scratch':
+        print("Note: from-scratch results are a single λ, not a sweep — plotted as one point.\n")
+    else:
+        print()
 
     svd_rows   = sorted(load_csv(svd_path), key=lambda r: r['k'])
-    bmshj_rows = sorted(load_csv(bmshj_path), key=lambda r: r['quality'])
+    bmshj_rows = sorted(normalize_bmshj_rows(bmshj_kind, load_csv(bmshj_path)), key=lambda r: r['rel_err'])
 
     svd_relerr   = np.array([r['rel_err']    for r in svd_rows])
     svd_bpv      = np.array([r['bpv_coeff']  for r in svd_rows])   # raw float32 coeffs, no entropy coding
@@ -97,7 +146,7 @@ def main():
     svd_comp     = np.array([r['comp_coeff'] for r in svd_rows])   # = 32 / bpv_coeff, same baseline
 
     bmshj_relerr = np.array([r['rel_err']    for r in bmshj_rows])
-    bmshj_bpv    = np.array([r['bpv']        for r in bmshj_rows])    # real arithmetic-coded bytes
+    bmshj_bpv    = np.array([r['bpv']        for r in bmshj_rows])    # real coded bytes either way
     bmshj_comp   = np.array([r['comp_ratio'] for r in bmshj_rows])
 
     # Optional: SVD real quantization + entropy-coding sweep (fairest comparison, if present)
@@ -155,13 +204,18 @@ def main():
         print(f"SVD best achievable (real):        rel_err={svd_real_best['rel_err']:.4f}  "
               f"comp_ratio={svd_real_best['real_comp_ratio']:.2f}x  BPV={svd_real_best['real_bpv']:.4f}  "
               f"k={int(svd_real_best['k'])}  bits={int(svd_real_best['bits'])}")
-    print(f"bmshj2018 best achievable:         rel_err={bmshj_best['rel_err']:.4f}  "
+    print(f"{bmshj_label_prefix} best achievable: rel_err={bmshj_best['rel_err']:.4f}  "
           f"comp_ratio={bmshj_best['comp_ratio']:.2f}x  BPV={bmshj_best['bpv']:.4f}  "
-          f"quality={int(bmshj_best['quality'])}")
+          f"({bmshj_best['label']})")
 
     # ------------------------------------------------------------------ #
     # Overlay plot
     # ------------------------------------------------------------------ #
+    is_sweep = len(bmshj_rows) > 1
+    bmshj_style = dict(marker='s', linestyle='-', markersize=5) if is_sweep \
+        else dict(marker='*', linestyle='none', markersize=5)
+    bmshj_plot_label = f"{bmshj_label_prefix} (real coded bytes)" + ("" if is_sweep else ", single λ")
+
     fig, ax = plt.subplots(figsize=(9, 5.5))
     ax.semilogy(svd_bpv, svd_relerr, 'o-', color='steelblue', markersize=5, alpha=0.5,
                 label='SVD (raw float32 coeffs, not compressed)')
@@ -170,8 +224,7 @@ def main():
     if svd_real_rows:
         ax.semilogy(svd_real_bpv, svd_real_relerr, 'D-', color='seagreen', markersize=5,
                     label='SVD (quantized + real-compressed, Pareto frontier)')
-    ax.semilogy(bmshj_bpv, bmshj_relerr, 's-', color='darkorange', markersize=5,
-                label='bmshj2018-factorized (real coded bytes)')
+    ax.semilogy(bmshj_bpv, bmshj_relerr, color='darkorange', label=bmshj_plot_label, **bmshj_style)
 
     for t in args.targets:
         ax.axhline(t, color='gray', linestyle=':', linewidth=0.6)
@@ -180,12 +233,12 @@ def main():
         ax.annotate(f"k={int(r['k'])}", (r['bpv_coeff'], r['rel_err']),
                     textcoords='offset points', xytext=(4, 4), fontsize=7, color='steelblue')
     for r in bmshj_rows:
-        ax.annotate(f"q={int(r['quality'])}", (r['bpv'], r['rel_err']),
+        ax.annotate(r['label'], (r['bpv'], r['rel_err']),
                     textcoords='offset points', xytext=(4, -8), fontsize=7, color='darkorange')
 
     ax.set_xlabel('Bits per voxel (BPV)')
     ax.set_ylabel('Relative reconstruction error (log scale)')
-    ax.set_title('SVD vs bmshj2018-factorized — Rate–Distortion comparison')
+    ax.set_title(f'SVD vs {bmshj_label_prefix} — Rate–Distortion comparison')
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -206,8 +259,7 @@ def main():
     if svd_real_rows:
         ax.loglog(svd_real_relerr, svd_real_comp, 'D-', color='seagreen', markersize=5,
                   label='SVD (quantized + real-compressed, Pareto frontier)')
-    ax.loglog(bmshj_relerr, bmshj_comp, 's-', color='darkorange', markersize=5,
-              label='bmshj2018-factorized (real coded bytes)')
+    ax.loglog(bmshj_relerr, bmshj_comp, color='darkorange', label=bmshj_plot_label, **bmshj_style)
 
     for t in args.targets:
         ax.axvline(t, color='gray', linestyle=':', linewidth=0.6)
@@ -216,12 +268,12 @@ def main():
         ax.annotate(f"k={int(r['k'])}", (r['rel_err'], r['comp_coeff']),
                     textcoords='offset points', xytext=(4, 4), fontsize=7, color='steelblue')
     for r in bmshj_rows:
-        ax.annotate(f"q={int(r['quality'])}", (r['rel_err'], r['comp_ratio']),
+        ax.annotate(r['label'], (r['rel_err'], r['comp_ratio']),
                     textcoords='offset points', xytext=(4, -8), fontsize=7, color='darkorange')
 
     ax.set_xlabel('Relative reconstruction error (log scale)')
     ax.set_ylabel('Compression ratio (log scale)')
-    ax.set_title('SVD vs bmshj2018-factorized — Compression ratio comparison')
+    ax.set_title(f'SVD vs {bmshj_label_prefix} — Compression ratio comparison')
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3, which='both')
     plt.tight_layout()
