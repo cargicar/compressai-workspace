@@ -131,14 +131,15 @@ def main():
     svd_path = resolve_csv(args.svd, 'svd_results.csv')
     bmshj_kind, bmshj_path = resolve_bmshj_csv(args.bmshj)
     bmshj_label_prefix = 'bmshj2018-pretrained' if bmshj_kind == 'pretrained' else 'bmshj2018-scratch'
-    print(f"bmshj2018 source: {bmshj_kind} ({bmshj_path})")
-    if bmshj_kind == 'scratch':
-        print("Note: from-scratch results are a single λ, not a sweep — plotted as one point.\n")
-    else:
-        print()
 
     svd_rows   = sorted(load_csv(svd_path), key=lambda r: r['k'])
     bmshj_rows = sorted(normalize_bmshj_rows(bmshj_kind, load_csv(bmshj_path)), key=lambda r: r['rel_err'])
+
+    print(f"bmshj2018 source: {bmshj_kind} ({bmshj_path})")
+    if bmshj_kind == 'scratch' and len(bmshj_rows) == 1:
+        print("Note: from-scratch results are a single λ, not a sweep — plotted as one point.\n")
+    else:
+        print()
 
     svd_relerr   = np.array([r['rel_err']    for r in svd_rows])
     svd_bpv      = np.array([r['bpv_coeff']  for r in svd_rows])   # raw float32 coeffs, no entropy coding

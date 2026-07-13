@@ -57,6 +57,7 @@ Usage
     python bmshj2018_scratch.py config_bmshj_scratch.yaml --iterations 5000 --lambda_ 2000
     python bmshj2018_scratch.py config_bmshj_scratch.yaml --channels-n 32 --channels-m 32
     python bmshj2018_scratch.py config_bmshj_scratch.yaml --output-dir results/scratch_run1
+    python bmshj2018_scratch.py config_bmshj_scratch.yaml --lambda-values 300 1000 3000 10000
 """
 
 import argparse
@@ -446,6 +447,13 @@ def main():
                              "Note this data is normalized to [0,1] not 255-level pixels, so "
                              "lambda needs to be ~255^2 larger than compressai's own lambda "
                              "convention for a comparable rate/distortion balance)")
+    parser.add_argument("--lambda-values", type=float, nargs="+", default=None,
+                        help="sweep multiple lambda values instead of a single run, analogous "
+                             "to svd_compression.py's --k-values (e.g. --lambda-values 300 1000 "
+                             "3000 10000). Overrides --lambda_/config's training.lambda_ when "
+                             "given. Unlike SVD's sweep (cheap, no retraining), each lambda here "
+                             "trains a fresh model from scratch — N values costs N times the "
+                             "compute of one run.")
     parser.add_argument("--patch-size", type=int, default=None,
                         help="training crop size (default: config's data.patch_size, falling "
                              "back to 128 if not set there; must be a multiple of 16 for the "
@@ -501,6 +509,9 @@ def main():
         args.slices_per_timestep = dcfg.get("slices_per_timestep", 16)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
+    lambda_values = args.lambda_values if args.lambda_values else [args.lambda_]
+    is_sweep = len(lambda_values) > 1
+
     out_dir = args.output_dir or os.path.join(
         "experiments", "scratch_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     )
@@ -525,7 +536,10 @@ def main():
     print(f"Device     : {device}")
     print(f"Field      : {field}")
     print(f"N, M       : {args.channels_n}, {args.channels_m}")
-    print(f"Lambda     : {args.lambda_}")
+    if is_sweep:
+        print(f"Lambda sweep: {lambda_values}  ({len(lambda_values)} full training runs)")
+    else:
+        print(f"Lambda     : {lambda_values[0]}")
     print(f"Patch size : {args.patch_size}")
     if args.patch_size % 16 != 0:
         print(f"WARNING: patch_size={args.patch_size} is not a multiple of 16 — the analysis "
@@ -562,111 +576,166 @@ def main():
     val_cache = (val_cache_raw - vmin) / (vmax - vmin + 1e-8)
 
     # ------------------------------------------------------------------ #
-    # Build + train model
+    # Lambda sweep — each value trains a fresh model from scratch
     # ------------------------------------------------------------------ #
-    model = Bmshj2018Scratch(in_channels=1, N=args.channels_n, M=args.channels_m).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params:,}\n")
-
-    print("Training ...")
-    history, val_history = train(model, train_cache, val_cache, args, device)
-    print("\nTraining done.\n")
-
-    # ------------------------------------------------------------------ #
-    # Plot 1 — training curves
-    # ------------------------------------------------------------------ #
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(history["iter"], history["loss"], color="steelblue", label="train")
-    axes[0].plot(val_history["iter"], val_history["loss"], color="darkorange", label="val")
-    axes[0].set_xlabel("iteration"); axes[0].set_ylabel("loss"); axes[0].set_title("Loss")
-    axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.3)
-
-    axes[1].plot(history["iter"], history["bpp"], color="steelblue", label="train")
-    axes[1].plot(val_history["iter"], val_history["bpp"], color="darkorange", label="val")
-    axes[1].set_xlabel("iteration"); axes[1].set_ylabel("bpp (entropy estimate)"); axes[1].set_title("Rate")
-    axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
-
-    axes[2].plot(history["iter"], history["psnr"], color="steelblue", label="train")
-    axes[2].plot(val_history["iter"], val_history["psnr"], color="darkorange", label="val")
-    axes[2].set_xlabel("iteration"); axes[2].set_ylabel("PSNR (dB)"); axes[2].set_title("Distortion")
-    axes[2].legend(fontsize=8); axes[2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    out = os.path.join(plots_dir, "training_curves.png")
-    plt.savefig(out, dpi=150)
-    plt.close()
-    print(f"Saved {out}")
-
-    # ------------------------------------------------------------------ #
-    # Full-volume evaluation on the held-out validation timestep
-    # ------------------------------------------------------------------ #
-    print(f"\nEvaluating on full held-out volume (t={args.val_timestep}) ...")
     full_vol = load_full_volume(dcfg["h5_path"], field, args.val_timestep)
     full_vol01 = (full_vol - vmin) / (vmax - vmin + 1e-8)
 
-    metrics, recon_vol, input_vol = evaluate(model, full_vol01, vmin, vmax, args.batch_size, device)
+    sweep_results = []
+    for lam in lambda_values:
+        tag = f"lambda{lam:g}"
+        print(f"\n{'='*60}\nTraining {tag}  ({args.iterations} iterations)\n{'='*60}")
+        args.lambda_ = lam  # train() reads args.lambda_ each call
 
-    print(f"rel_err              : {metrics['rel_err']:.6f}")
-    print(f"PSNR                 : {metrics['psnr']:.2f} dB")
-    print(f"bpp (entropy est.)   : {metrics['bpp_estimate']:.4f}  "
-          f"(comp_ratio_est. {metrics['comp_ratio_estimate']:.2f}x)")
-    print(f"Real bytes (zlib/lzma): {metrics['real_bytes']:,}  "
-          f"(BPV={metrics['real_bpv']:.4f}, comp_ratio={metrics['real_comp_ratio']:.2f}x)")
+        # ------------------------------------------------------------------ #
+        # Build + train a fresh model for this lambda
+        # ------------------------------------------------------------------ #
+        model = Bmshj2018Scratch(in_channels=1, N=args.channels_n, M=args.channels_m).to(device)
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"Model parameters: {n_params:,}\n")
+
+        print("Training ...")
+        history, val_history = train(model, train_cache, val_cache, args, device)
+        print("\nTraining done.\n")
+
+        # ------------------------------------------------------------------ #
+        # Plot 1 — training curves
+        # ------------------------------------------------------------------ #
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        axes[0].plot(history["iter"], history["loss"], color="steelblue", label="train")
+        axes[0].plot(val_history["iter"], val_history["loss"], color="darkorange", label="val")
+        axes[0].set_xlabel("iteration"); axes[0].set_ylabel("loss"); axes[0].set_title("Loss")
+        axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(history["iter"], history["bpp"], color="steelblue", label="train")
+        axes[1].plot(val_history["iter"], val_history["bpp"], color="darkorange", label="val")
+        axes[1].set_xlabel("iteration"); axes[1].set_ylabel("bpp (entropy estimate)"); axes[1].set_title("Rate")
+        axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(history["iter"], history["psnr"], color="steelblue", label="train")
+        axes[2].plot(val_history["iter"], val_history["psnr"], color="darkorange", label="val")
+        axes[2].set_xlabel("iteration"); axes[2].set_ylabel("PSNR (dB)"); axes[2].set_title("Distortion")
+        axes[2].legend(fontsize=8); axes[2].grid(True, alpha=0.3)
+
+        fig.suptitle(f"{tag}", fontsize=10)
+        plt.tight_layout()
+        out = os.path.join(plots_dir, f"training_curves_{tag}.png")
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved {out}")
+
+        # ------------------------------------------------------------------ #
+        # Full-volume evaluation on the held-out validation timestep
+        # ------------------------------------------------------------------ #
+        print(f"\nEvaluating {tag} on full held-out volume (t={args.val_timestep}) ...")
+        metrics, recon_vol, input_vol = evaluate(model, full_vol01, vmin, vmax, args.batch_size, device)
+
+        print(f"rel_err              : {metrics['rel_err']:.6f}")
+        print(f"PSNR                 : {metrics['psnr']:.2f} dB")
+        print(f"bpp (entropy est.)   : {metrics['bpp_estimate']:.4f}  "
+              f"(comp_ratio_est. {metrics['comp_ratio_estimate']:.2f}x)")
+        print(f"Real bytes (zlib/lzma): {metrics['real_bytes']:,}  "
+              f"(BPV={metrics['real_bpv']:.4f}, comp_ratio={metrics['real_comp_ratio']:.2f}x)")
+
+        # ------------------------------------------------------------------ #
+        # Plot 2 — full-volume reconstruction
+        # ------------------------------------------------------------------ #
+        D, H, W = input_vol.shape
+        mD, mH, mW = D // 2, H // 2, W // 2
+        plane_defs = [
+            ("XY (z=mid)", input_vol[:, :, mW], recon_vol[:, :, mW]),
+            ("XZ (y=mid)", input_vol[:, mH, :], recon_vol[:, mH, :]),
+            ("YZ (x=mid)", input_vol[mD, :, :], recon_vol[mD, :, :]),
+        ]
+        fig, axes = plt.subplots(2, 3, figsize=(14, 9))
+        fig.suptitle(
+            f"From-scratch bmshj2018  |  N={args.channels_n} M={args.channels_m} lambda={lam:g}  "
+            f"rel_err={metrics['rel_err']:.4f}  bpp_est={metrics['bpp_estimate']:.3f}  "
+            f"real_comp={metrics['real_comp_ratio']:.2f}x",
+            fontsize=10,
+        )
+        for col, (lbl, inp_p, rec_p) in enumerate(plane_defs):
+            vmax_p = np.percentile(np.abs(inp_p), 99)
+            for row, (data, row_lbl) in enumerate([(inp_p, "Input"), (rec_p, "Reconstruction")]):
+                ax = axes[row, col]
+                im = ax.imshow(data, cmap="RdBu_r", vmin=-vmax_p, vmax=vmax_p, origin="lower", aspect="equal")
+                if row == 0:
+                    ax.set_title(lbl, fontsize=9)
+                if col == 0:
+                    ax.set_ylabel(row_lbl, fontsize=9)
+                ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+                plt.colorbar(im, ax=ax, shrink=0.85)
+        plt.tight_layout()
+        out = os.path.join(plots_dir, f"full_volume_reconstruction_{tag}.png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Saved {out}")
+
+        row = dict(
+            channels_n=args.channels_n, channels_m=args.channels_m, lambda_=lam,
+            iterations=args.iterations, **metrics,
+        )
+        sweep_results.append(row)
+
+        ckpt_path = os.path.join(out_dir, f"model_{tag}.pt")
+        torch.save({"model_state": model.state_dict(),
+                    "vmin": vmin, "vmax": vmax,
+                    "args": vars(args)}, ckpt_path)
+        print(f"Checkpoint saved to {ckpt_path}")
 
     # ------------------------------------------------------------------ #
-    # Plot 2 — full-volume reconstruction
-    # ------------------------------------------------------------------ #
-    D, H, W = input_vol.shape
-    mD, mH, mW = D // 2, H // 2, W // 2
-    plane_defs = [
-        ("XY (z=mid)", input_vol[:, :, mW], recon_vol[:, :, mW]),
-        ("XZ (y=mid)", input_vol[:, mH, :], recon_vol[:, mH, :]),
-        ("YZ (x=mid)", input_vol[mD, :, :], recon_vol[mD, :, :]),
-    ]
-    fig, axes = plt.subplots(2, 3, figsize=(14, 9))
-    fig.suptitle(
-        f"From-scratch bmshj2018  |  N={args.channels_n} M={args.channels_m} lambda={args.lambda_}  "
-        f"rel_err={metrics['rel_err']:.4f}  bpp_est={metrics['bpp_estimate']:.3f}  "
-        f"real_comp={metrics['real_comp_ratio']:.2f}x",
-        fontsize=10,
-    )
-    for col, (lbl, inp_p, rec_p) in enumerate(plane_defs):
-        vmax_p = np.percentile(np.abs(inp_p), 99)
-        for row, (data, row_lbl) in enumerate([(inp_p, "Input"), (rec_p, "Reconstruction")]):
-            ax = axes[row, col]
-            im = ax.imshow(data, cmap="RdBu_r", vmin=-vmax_p, vmax=vmax_p, origin="lower", aspect="equal")
-            if row == 0:
-                ax.set_title(lbl, fontsize=9)
-            if col == 0:
-                ax.set_ylabel(row_lbl, fontsize=9)
-            ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-            plt.colorbar(im, ax=ax, shrink=0.85)
-    plt.tight_layout()
-    out = os.path.join(plots_dir, "full_volume_reconstruction.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved {out}")
-
-    # ------------------------------------------------------------------ #
-    # Save results CSV + checkpoint
+    # Combined results CSV — same schema as a single run, one row per lambda,
+    # so compare_compression.py's existing scratch-results handling (which
+    # already draws a line + annotations when len(rows) > 1) needs no changes.
     # ------------------------------------------------------------------ #
     import csv
     csv_path = os.path.join(out_dir, "scratch_results.csv")
-    row = dict(
-        channels_n=args.channels_n, channels_m=args.channels_m, lambda_=args.lambda_,
-        iterations=args.iterations, **metrics,
-    )
     with open(csv_path, "w", newline="") as csvf:
-        writer = csv.DictWriter(csvf, fieldnames=row.keys())
+        writer = csv.DictWriter(csvf, fieldnames=sweep_results[0].keys())
         writer.writeheader()
-        writer.writerow(row)
-    print(f"\nResults saved to {csv_path}")
+        writer.writerows(sweep_results)
+    print(f"\nCombined results saved to {csv_path}")
 
-    ckpt_path = os.path.join(out_dir, "model.pt")
-    torch.save({"model_state": model.state_dict(),
-                "vmin": vmin, "vmax": vmax,
-                "args": vars(args)}, ckpt_path)
-    print(f"Checkpoint saved to {ckpt_path}")
+    # Best lambda at rel_err <= 1%, mirroring svd_compression.py's summary convention
+    under_1pct = [r for r in sweep_results if r["rel_err"] <= 0.01]
+    if under_1pct:
+        best = max(under_1pct, key=lambda r: r["real_comp_ratio"])
+        print(f"Best (rel_err ≤ 1%): lambda={best['lambda_']:g}  rel_err={best['rel_err']:.4f}  "
+              f"real_comp={best['real_comp_ratio']:.2f}x  real_bpv={best['real_bpv']:.4f}")
+    else:
+        best = min(sweep_results, key=lambda r: r["rel_err"])
+        print(f"Note: rel_err never reaches 1% — best is lambda={best['lambda_']:g}  "
+              f"rel_err={best['rel_err']:.4f}  real_comp={best['real_comp_ratio']:.2f}x  "
+              f"real_bpv={best['real_bpv']:.4f}")
+
+    # ------------------------------------------------------------------ #
+    # Plot 3 — rate-distortion across the lambda sweep
+    # ------------------------------------------------------------------ #
+    sweep_sorted = sorted(sweep_results, key=lambda r: r["rel_err"])
+    rel_errs      = [r["rel_err"] for r in sweep_sorted]
+    real_bpvs     = [r["real_bpv"] for r in sweep_sorted]
+    bpp_estimates = [r["bpp_estimate"] for r in sweep_sorted]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.semilogy(real_bpvs, rel_errs, 'D-', color='seagreen', markersize=6,
+                label='real coded bytes (zlib/lzma)')
+    ax.semilogy(bpp_estimates, rel_errs, 's--', color='steelblue', markersize=4, alpha=0.6,
+                label='entropy estimate (paper convention)')
+    ax.axhline(0.01, color='red', linestyle=':', linewidth=1, label='1% error target')
+    for r in sweep_sorted:
+        ax.annotate(f"λ={r['lambda_']:g}", (r['real_bpv'], r['rel_err']),
+                    textcoords='offset points', xytext=(4, 4), fontsize=7, color='seagreen')
+    ax.set_xlabel('Bits per voxel (BPV)')
+    ax.set_ylabel('Relative reconstruction error (log scale)')
+    ax.set_title(f'From-scratch bmshj2018 Rate–Distortion  |  N={args.channels_n} M={args.channels_m}'
+                 + ('  (single run)' if not is_sweep else f'  ({len(lambda_values)}-point sweep)'))
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out = os.path.join(plots_dir, "rate_distortion_sweep.png")
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
 
     print("\nDone.")
     _log.close()

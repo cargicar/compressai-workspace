@@ -433,6 +433,160 @@ eval — two different jobs, two different mechanisms in this codebase.
 modeling are solving different problems, and the equivalence only holds under specific
 (non-perceptual, MSE-based) conditions.
 
+## SVD baseline's `quantize_coeffs` / `real_compress_bytes` — implementation deep dive
+
+Not part of the paper — this is `svd_compression.py`'s quantization step, added to make the SVD
+baseline's compression ratio comparable to a real codec's (see `compare_compression.py`). Included
+here since it's the same underlying idea as the paper's quantizer (Eq. 8), just applied to SVD
+coefficients instead of a learned latent, and it's useful to see the two side by side.
+
+### Why per-column, not one global scale
+
+```python
+col_scale = np.abs(coeffs_full).max(axis=0)   # (k_max,) — one scale per component
+q, dequant = quantize_coeffs(coeffs_full[:, :k], col_scale_k, bits)
+```
+`coeffs_k` is `(n_patches, k)` — each *column* holds one SVD component's coefficient across every
+patch. SVD orders components by decreasing singular value, so the first retained component's
+coefficients are typically far larger than the k-th one's (observed directly in one run: singular
+values ranged from `1824.969` down to `0.0006`). A single shared scale across the whole matrix
+would be dominated by the huge early components, crushing the smaller later ones to almost
+nothing (most values rounding to 0 or ±1, wasting their bit budget entirely). Giving **each
+column its own scale** lets every component use its full `bits`-bit dynamic range regardless of
+its typical magnitude — the same idea as JPEG using a different quantization step per DCT
+frequency band rather than one blanket step for the whole block.
+
+### The quantizer itself
+
+```python
+levels = 2 ** bits
+qmax = levels // 2 - 1
+dtype = np.int8 if bits <= 8 else (np.int16 if bits <= 16 else np.int32)
+scale = np.where(col_scale_k > 0, col_scale_k, 1.0)
+q = np.round(coeffs_k / scale * qmax).clip(-qmax, qmax).astype(dtype)
+dequant = q.astype(np.float32) * scale / qmax
+```
+
+- `levels`/`qmax`: for `bits=8`, `levels=256`, `qmax=127` — a **symmetric signed range**
+  `[-127,127]`, deliberately not using the full `[-128,127]` int8 range so the quantizer is
+  perfectly symmetric around zero (coefficients are signed with no inherent bias).
+- `dtype`: picks the smallest numpy integer type that can hold `qmax`, so the raw representation
+  isn't padded wider than the requested bit-depth needs — matters because `real_compress_bytes()`
+  later calls `.tobytes()` directly on this array.
+- `scale = np.where(...)`: guards against a column whose max absolute value is exactly `0`
+  (dividing by it would produce `NaN`/`Inf`); substituting `1.0` is harmless since `0/anything=0`.
+- `q = np.round(coeffs_k / scale * qmax)...`: the actual quantization, in three moves — normalize
+  the column to roughly `[-1,1]` by its own max, stretch that out to fill `[-qmax,qmax]`, then
+  **round to the nearest integer**. That `round()` is the one genuinely lossy step; everything
+  before it is just rescaling. `.clip()` is cheap insurance against floating-point boundary
+  overshoot.
+- `dequant = q * scale / qmax`: the exact inverse of the rescaling (not of the rounding — that
+  information is gone for good). This is what actually flows into `reconstruct_volume()`
+  afterward, so the reported `rel_err`/PSNR for each `(k, bits)` pair reflects real quantization
+  error on top of the truncation error from `k`.
+
+### A concrete trace
+
+Column scale `col_scale_k = 1824.9`, true coefficient `900`, `bits=8` (`qmax=127`):
+`900 / 1824.9 * 127 ≈ 62.6` → round → `63` (stored as `int8`) → dequantize:
+`63 * 1824.9 / 127 ≈ 905.5`. `905.5` vs. the true `900` — a small, expected quantization error.
+`q=63` is what actually gets handed to `real_compress_bytes()` for genuine zlib/lzma entropy
+coding; `dequant≈905.5` is what's used to measure how much that quantization hurt reconstruction.
+
+### `real_compress_bytes` — the genuinely-measured byte count
+
+```python
+def real_compress_bytes(q: np.ndarray) -> int:
+    raw = q.tobytes()
+    zlib_bytes = zlib.compress(raw, level=9)
+    lzma_bytes = lzma.compress(raw, preset=9)
+    if len(zlib_bytes) <= len(lzma_bytes):
+        assert zlib.decompress(zlib_bytes) == raw, "real entropy coding round-trip failed"
+        return len(zlib_bytes)
+    assert lzma.decompress(lzma_bytes) == raw, "real entropy coding round-trip failed"
+    return len(lzma_bytes)
+```
+
+Takes `quantize_coeffs`'s integer output `q` and turns it into an actual, honestly-measured byte
+count — this is what makes SVD's compression ratio comparable to a genuine codec, rather than a
+theoretical estimate.
+
+**What it's given**: called as `real_compress_bytes(q)` where `q` is the *entire* quantized
+coefficient matrix for one `(k, bits)` combination — shape `(n_patches, k)`, every patch's
+retained coefficients together, not compressed patch-by-patch. Compressing the whole thing as one
+blob lets the compressor exploit statistics shared *across* patches (column 0 has a similarly
+narrow distribution for every patch once quantized, so DEFLATE/LZMA's dictionary matching can
+actually find and exploit that repetition) — compressing each patch separately would lose that
+cross-patch redundancy and add per-stream overhead on every tiny blob. This also mirrors how
+you'd realistically store a compressed snapshot: as one file, not thousands of little ones.
+
+**Line by line**:
+- `raw = q.tobytes()`: serializes the array into a flat byte string (C/row-major order). Length is
+  exactly `q.size * q.itemsize` — e.g. for `int8` (the dtype `quantize_coeffs` picks for
+  `bits<=8`), precisely `n_patches * k` bytes.
+- `zlib.compress(raw, level=9)` / `lzma.compress(raw, preset=9)`: runs the *same* raw bytes through
+  two genuinely different, standard lossless compressors, both at max compression. zlib is DEFLATE
+  (LZ77 + Huffman, the gzip/PNG family); lzma is generally stronger (larger dictionary window,
+  range coding instead of Huffman, the `.7z`/`.xz` family) but slower.
+- Picks whichever produced the smaller output *for this specific data* — what a real deployment
+  would do too (try a couple of standard codecs, keep the winner), rather than committing blindly
+  to one. Only runs once per `(k, bits)` combination in a sweep (not a hot loop), so paying for
+  both algorithms at their slowest/best settings is a reasonable one-time cost.
+- `assert ... == raw` on the winning output: not a formality — a genuine correctness check.
+  Compression only means anything for a fair comparison if it's actually lossless; decompressing
+  the exact bytes kept and confirming they reconstruct `raw` byte-for-byte guards against ever
+  reporting a byte count for something that would silently corrupt data if relied on. Same
+  discipline `bmshj2018_scratch.py`'s identically-named function applies to the rounded neural
+  latent — same idea, same code, reused verbatim across both scripts (see below).
+
+**Honest limits**: the returned byte count includes zlib/lzma's own format overhead (stream
+headers, checksums — a handful to a few dozen bytes), so it's not a bare theoretical entropy-coder
+floor — but that's exactly the overhead a real file format would also pay, so it's an honest
+number for "what this would actually take on disk," not artificially flattering.
+
+### Where the analogous steps live in `bmshj2018_scratch.py`
+
+**`real_compress_bytes` is literally the same function**, copied verbatim into
+`bmshj2018_scratch.py` — identical zlib/lzma best-of-two logic, identical round-trip assertion.
+Used there as:
+```python
+latent = np.concatenate(latent_chunks, axis=0)
+real_bytes = real_compress_bytes(latent)
+```
+where `latent` is the concatenated rounded integer latent for the whole held-out volume. No
+conceptual translation needed — the same "real bytes on disk" mechanism serves the exact same
+role in both pipelines.
+
+**`quantize_coeffs` has no direct equivalent** — its role is played by plain `torch.round(y)`
+inside `FactorizedEntropy.forward()` at eval time, and re-applied in `evaluate()`:
+```python
+y_tilde = torch.round(y)                                              # FactorizedEntropy, eval
+latent_chunks.append(y_tilde.round().to(torch.int32).cpu().numpy())   # evaluate()
+```
+Notice what's missing compared to `quantize_coeffs`: no `bits` parameter, no per-column `scale`,
+no explicit choice of integer width — just plain rounding to the nearest integer, always. This
+asymmetry is real, not an oversight: SVD's raw coefficients have wildly different magnitude
+ranges across components (singular values spanning `1824.9` down to `0.0006`), so `quantize_coeffs`
+*has* to explicitly rescale each column and pick a bit-depth for integer quantization to mean
+anything. The neural network doesn't have that problem — `GDN` normalization inside `g_a`,
+combined with training the whole network jointly against `FactorizedEntropy`'s rate loss, means
+the network *learns* to produce a latent `y` whose natural scale is already calibrated so that
+rounding to the nearest integer is the right quantization step (bin width exactly 1, matching what
+`FactorizedEntropy` assumes when evaluating `CDF(y±0.5)`). There's no bit-depth knob to choose
+because the network's own weights implicitly encode the equivalent of "how many effective bits"
+each latent value carries — baked in during training, not chosen after the fact.
+
+**So what plays `--quant-bits`'s role?** Not a quantization parameter at all — it's
+`training.lambda_` in `config_bmshj_scratch.yaml`. `svd_compression.py` explicitly sweeps
+`--quant-bits` post-hoc (no retraining needed — SVD is analytic) to trace a rate-distortion curve.
+`bmshj2018_scratch.py` instead controls that trade-off via `lambda_` *during training* — a
+different `λ` produces a differently-trained network whose learned latent naturally settles at a
+different effective rate/distortion point (exactly the mechanism behind why `λ=0.01` collapsed to
+a constant reconstruction while `λ=1000` worked, discussed in the module docstring). This is also
+why `bmshj2018_scratch.py` currently produces only a single point per run rather than a full sweep
+like SVD's `(k, bits)` grid — sweeping `λ` here means retraining a separate model per value, not
+just re-quantizing already-computed coefficients.
+
 ## Diagrams created in this chat
 - Rate–distortion trade-off curve (convex achievable region, two example λ operating points).
 
