@@ -42,12 +42,21 @@ lambda values for a comparable rate/distortion balance -- e.g. CompressAI's lamb
 collapses to a near-constant (cheap-to-encode) reconstruction; that failure mode is exactly what
 motivated raising this script's default from an initial (buggy) 0.01 to 1000.
 
+Config
+------
+Use `config_bmshj_scratch.yaml`, a config file exclusive to this script (data/model/training
+sections with values valid for this architecture, e.g. `data.patch_size: 128`). Do not point this
+script at the SVD/LCA pipeline's shared config (e.g. `config_svd.yaml`) — its `data.patch_size: 9`
+is a 3D voxel-patch length, a different scale entirely (not a multiple of 16, so it triggers this
+script's startup warning and then crashes the MSE loss). Any CLI flag overrides the config value
+it corresponds to.
+
 Usage
 -----
-    python bmshj2018_scratch.py config_simmldc.yaml
-    python bmshj2018_scratch.py config_simmldc.yaml --iterations 5000 --lambda_ 2000
-    python bmshj2018_scratch.py config_simmldc.yaml --channels-n 32 --channels-m 32
-    python bmshj2018_scratch.py config_simmldc.yaml --output-dir results/scratch_run1
+    python bmshj2018_scratch.py config_bmshj_scratch.yaml
+    python bmshj2018_scratch.py config_bmshj_scratch.yaml --iterations 5000 --lambda_ 2000
+    python bmshj2018_scratch.py config_bmshj_scratch.yaml --channels-n 32 --channels-m 32
+    python bmshj2018_scratch.py config_bmshj_scratch.yaml --output-dir results/scratch_run1
 """
 
 import argparse
@@ -258,7 +267,9 @@ class Bmshj2018Scratch(nn.Module):
 
 def load_slice_cache(h5_path: str, field: str, timesteps: list, slices_per_timestep: int,
                       rng: np.random.Generator) -> np.ndarray:
-    """Read a modest in-RAM cache of 2D z-slices (axis 0, contiguous HDF5 reads)."""
+    """Read a modest in-RAM cache of 2D z-slices (axis 0, contiguous HDF5 reads).
+        per each t in timesteps, randomly sample up to `slices_per_timestep` (Y,Z) slices.
+        n_slices = len(timesteps) * slices_per_timestep, shape = (n_slices, H, W)"""
     slices = []
     with h5py.File(h5_path, "r") as f:
         dset = f[field]
@@ -337,7 +348,7 @@ def train(model, train_cache, val_cache, args, device):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
+        
         if it % 50 == 0 or it == 1:
             psnr = 10 * math.log10(1.0 / max(mse.item(), 1e-12))
             history["iter"].append(it)
@@ -347,7 +358,6 @@ def train(model, train_cache, val_cache, args, device):
             history["psnr"].append(psnr)
             print(f"iter {it:>6}/{args.iterations}  loss={loss.item():.4f}  "
                   f"bpp={bpp.item():.4f}  mse={mse.item():.6f}  psnr={psnr:.2f}dB")
-
         if it % 500 == 0:
             model.eval()
             with torch.no_grad():
@@ -421,23 +431,42 @@ def parse_timestep_range(s: str) -> list:
 
 def main():
     parser = argparse.ArgumentParser(description="From-scratch bmshj2018-factorized (no compressai)")
-    parser.add_argument("config", help="path to config_simmldc.yaml")
-    parser.add_argument("--field", default=None, help="override config's field_key")
-    parser.add_argument("--channels-n", type=int, default=64, help="main conv channel count (N)")
-    parser.add_argument("--channels-m", type=int, default=64, help="latent channel count (M)")
-    parser.add_argument("--lambda_", type=float, default=1000.0,
-                        help="rate-distortion trade-off weight (loss = lambda*MSE + bpp; "
-                             "note this data is normalized to [0,1] not 255-level pixels, "
-                             "so lambda needs to be ~255^2 larger than compressai's own "
-                             "lambda convention for a comparable rate/distortion balance)")
-    parser.add_argument("--patch-size", type=int, default=128, help="training crop size")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--iterations", type=int, default=3000)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--train-timesteps", default="0-34", help="e.g. '0-34'")
-    parser.add_argument("--val-timestep", type=int, default=40, help="held out of training entirely")
-    parser.add_argument("--slices-per-timestep", type=int, default=16,
-                        help="random z-slices cached per timestep for training/quick-val batches")
+    parser.add_argument("config", help="path to config_bmshj_scratch.yaml (or another config "
+                                        "with the same data/model/training layout)")
+    parser.add_argument("--field", default=None, help="override config's data.field_key")
+    parser.add_argument("--channels-n", type=int, default=None,
+                        help="main conv channel count N (default: config's model.channels_n, "
+                             "falling back to 64)")
+    parser.add_argument("--channels-m", type=int, default=None,
+                        help="latent channel count M (default: config's model.channels_m, "
+                             "falling back to 64)")
+    parser.add_argument("--lambda_", type=float, default=None,
+                        help="rate-distortion trade-off weight (default: config's "
+                             "training.lambda_, falling back to 1000; loss = lambda*MSE + bpp. "
+                             "Note this data is normalized to [0,1] not 255-level pixels, so "
+                             "lambda needs to be ~255^2 larger than compressai's own lambda "
+                             "convention for a comparable rate/distortion balance)")
+    parser.add_argument("--patch-size", type=int, default=None,
+                        help="training crop size (default: config's data.patch_size, falling "
+                             "back to 128 if not set there; must be a multiple of 16 for the "
+                             "4-stage stride-2 downsample to invert cleanly — see warning at "
+                             "startup if not)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="default: config's training.batch_size, falling back to 16")
+    parser.add_argument("--iterations", type=int, default=None,
+                        help="default: config's training.iterations, falling back to 3000")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="default: config's training.lr, falling back to 1e-4")
+    parser.add_argument("--train-timesteps", default=None,
+                        help="e.g. '0-34' (default: config's data.train_timesteps, falling "
+                             "back to '0-34')")
+    parser.add_argument("--val-timestep", type=int, default=None,
+                        help="held out of training entirely (default: config's "
+                             "data.val_timestep, falling back to 40)")
+    parser.add_argument("--slices-per-timestep", type=int, default=None,
+                        help="random z-slices cached per timestep for training/quick-val "
+                             "batches (default: config's data.slices_per_timestep, falling "
+                             "back to 16)")
     parser.add_argument("--device", default=None, help="cuda / cpu (default: cuda if available)")
     parser.add_argument("--output-dir", default=None,
                         help="output directory (default: experiments/scratch_TIMESTAMP)")
@@ -446,7 +475,30 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     dcfg = cfg["data"]
+    mcfg = cfg.get("model", {})
+    tcfg = cfg.get("training", {})
     field = args.field or dcfg["field_key"]
+
+    if args.patch_size is None:
+        args.patch_size = dcfg.get("patch_size", 128)
+    if args.channels_n is None:
+        args.channels_n = mcfg.get("channels_n", 64)
+    if args.channels_m is None:
+        args.channels_m = mcfg.get("channels_m", 64)
+    if args.lambda_ is None:
+        args.lambda_ = tcfg.get("lambda_", 1000.0)
+    if args.batch_size is None:
+        args.batch_size = tcfg.get("batch_size", 16)
+    if args.iterations is None:
+        args.iterations = tcfg.get("iterations", 3000)
+    if args.lr is None:
+        args.lr = tcfg.get("lr", 1e-4)
+    if args.train_timesteps is None:
+        args.train_timesteps = dcfg.get("train_timesteps", "0-34")
+    if args.val_timestep is None:
+        args.val_timestep = dcfg.get("val_timestep", 40)
+    if args.slices_per_timestep is None:
+        args.slices_per_timestep = dcfg.get("slices_per_timestep", 16)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     out_dir = args.output_dir or os.path.join(
@@ -455,7 +507,7 @@ def main():
     plots_dir = os.path.join(out_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
     import shutil
-    shutil.copy(args.config, os.path.join(out_dir, "config_simmldc.yaml"))
+    shutil.copy(args.config, os.path.join(out_dir, os.path.basename(args.config)))
 
     log_path = os.path.join(out_dir, "run.log")
     import builtins
@@ -475,6 +527,15 @@ def main():
     print(f"N, M       : {args.channels_n}, {args.channels_m}")
     print(f"Lambda     : {args.lambda_}")
     print(f"Patch size : {args.patch_size}")
+    if args.patch_size % 16 != 0:
+        print(f"WARNING: patch_size={args.patch_size} is not a multiple of 16 — the analysis "
+              f"transform's 4 stride-2 downsampling stages won't invert cleanly, and the "
+              f"synthesis transform will produce a mismatched output shape (x_hat.shape != "
+              f"x.shape), crashing the MSE loss. Use a multiple of 16 (e.g. 96, 112, 128, 144) "
+              f"via --patch-size, or update {args.config}'s data.patch_size="
+              f"{dcfg.get('patch_size')!r} (note: if this is the SVD/LCA pipeline's shared "
+              f"config, that value is its 3D voxel-patch length, a different scale entirely — "
+              f"not a valid 2D crop size here; use config_bmshj_scratch.yaml instead).")
     print(f"Iterations : {args.iterations}\n")
 
     train_timesteps = parse_timestep_range(args.train_timesteps)

@@ -1,0 +1,26 @@
+# Config for bmshj2018_scratch.py — the from-scratch (no compressai) bmshj2018-factorized
+# reimplementation. Kept separate from config_simmldc.yaml: that file's data.patch_size (9) is
+# a 3D SVD/LCA voxel-patch side length, a completely different scale from the 2D image crop size
+# this script needs (must be a multiple of 16, typically 64-256).
+#
+# CLI flags always override these values, e.g. `--patch-size 96` beats patch_size below.
+
+data:
+  h5_path:             "/data/mldc/pde_bench/Turb_M1.hdf5"
+  field_key:           "pressure"
+  patch_size:          128         # 2D training crop size; multiple of 16 (4 stride-2 stages)
+  train_timesteps:     "0-34"     # e.g. "0-34" or a single index; held out of val_timestep
+  val_timestep:        40         # held out of training entirely, used for full-volume eval
+  slices_per_timestep: 16         # random z-slices cached per timestep for train/quick-val batches
+
+model:
+  channels_n: 64   # main conv channel count (N)
+  channels_m: 64   # latent channel count (M)
+
+training:
+  lambda_:    1000.0   # rate-distortion trade-off weight (loss = lambda*MSE + bpp); see
+                        # bmshj2018_scratch.py's module docstring for why this needs to be
+                        # ~255^2 larger than compressai's own lambda convention
+  batch_size: 16
+  iterations: 3000
+  lr:         0.0001
