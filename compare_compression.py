@@ -2,12 +2,14 @@
 Compare two compression baselines (SVD and a bmshj2018-factorized model) on
 the same rel_err / BPV metrics.
 
-The bmshj2018 side can be either `bmshj2018_compression.py`'s pretrained-model
-sweep (`bmshj2018_results.csv`, swept over `quality`) or
-`bmshj2018_scratch.py`'s from-scratch run (`scratch_results.csv`, currently a
-single λ, not a sweep) — this script auto-detects which one is present in the
-given directory and normalizes both into the same rel_err/bpv/comp_ratio
-fields so the rest of the script doesn't care which one it's looking at.
+The bmshj2018 side can be `bmshj2018_compression.py`'s pretrained-model sweep
+(`bmshj2018_results.csv`, swept over `quality`), `bmshj2018_scratch.py`'s
+from-scratch run (`scratch_results.csv`, currently a single λ, not a sweep),
+or `bmshj2018_finetune.py`'s fine-tune run (`finetune_results.csv`, exactly
+two rows: the pretrained checkpoint before and after fine-tuning) — this
+script auto-detects which one is present in the given directory and
+normalizes all three into the same rel_err/bpv/comp_ratio fields so the rest
+of the script doesn't care which one it's looking at.
 
 Both `svd_compression.py` and `bmshj2018_compression.py`/`bmshj2018_scratch.py`
 already report comparable metrics (rel_err, PSNR, comp_ratio, BPV). This script
@@ -46,32 +48,37 @@ def resolve_csv(path: str, expected_name: str) -> str:
     return path
 
 
+BMSHJ_CSV_NAMES = {
+    'bmshj2018_results.csv': 'pretrained',
+    'scratch_results.csv': 'scratch',
+    'finetune_results.csv': 'finetune',
+}
+
+
 def resolve_bmshj_csv(path: str):
-    """Auto-detect a pretrained (bmshj2018_results.csv) or from-scratch
-    (scratch_results.csv) results file. Returns (kind, csv_path)."""
+    """Auto-detect a pretrained (bmshj2018_results.csv), from-scratch
+    (scratch_results.csv), or fine-tune (finetune_results.csv) results file.
+    Returns (kind, csv_path)."""
     if os.path.isdir(path):
-        pretrained = os.path.join(path, 'bmshj2018_results.csv')
-        scratch = os.path.join(path, 'scratch_results.csv')
-        if os.path.isfile(pretrained):
-            return 'pretrained', pretrained
-        if os.path.isfile(scratch):
-            return 'scratch', scratch
-        raise FileNotFoundError(
-            f"Expected bmshj2018_results.csv or scratch_results.csv inside {path}")
+        for name, kind in BMSHJ_CSV_NAMES.items():
+            candidate = os.path.join(path, name)
+            if os.path.isfile(candidate):
+                return kind, candidate
+        raise FileNotFoundError(f"Expected one of {list(BMSHJ_CSV_NAMES)} inside {path}")
     basename = os.path.basename(path)
-    kind = 'scratch' if basename == 'scratch_results.csv' else 'pretrained'
+    kind = BMSHJ_CSV_NAMES.get(basename, 'pretrained')
     return kind, path
 
 
-def load_csv(path: str) -> list:
+def load_csv(path: str, string_cols: frozenset = frozenset()) -> list:
     with open(path, newline='') as f:
         rows = list(csv.DictReader(f))
-    return [{k: float(v) for k, v in row.items()} for row in rows]
+    return [{k: (v if k in string_cols else float(v)) for k, v in row.items()} for row in rows]
 
 
 def normalize_bmshj_rows(kind: str, rows: list) -> list:
     """Add unified 'bpv' / 'comp_ratio' / 'label' fields regardless of source,
-    so the rest of the script doesn't need to know pretrained vs scratch."""
+    so the rest of the script doesn't need to know pretrained vs scratch vs finetune."""
     normalized = []
     for r in rows:
         row = dict(r)
@@ -79,6 +86,10 @@ def normalize_bmshj_rows(kind: str, rows: list) -> list:
             row['bpv'] = r['bpv']
             row['comp_ratio'] = r['comp_ratio']
             row['label'] = f"q={int(r['quality'])}"
+        elif kind == 'finetune':
+            row['bpv'] = r['bpv']
+            row['comp_ratio'] = r['comp_ratio']
+            row['label'] = f"{r['label']} (q={int(r['quality'])})"
         else:
             row['bpv'] = r['real_bpv']
             row['comp_ratio'] = r['real_comp_ratio']
@@ -130,14 +141,23 @@ def main():
 
     svd_path = resolve_csv(args.svd, 'svd_results.csv')
     bmshj_kind, bmshj_path = resolve_bmshj_csv(args.bmshj)
-    bmshj_label_prefix = 'bmshj2018-pretrained' if bmshj_kind == 'pretrained' else 'bmshj2018-scratch'
+    bmshj_label_prefix = {
+        'pretrained': 'bmshj2018-pretrained',
+        'scratch': 'bmshj2018-scratch',
+        'finetune': 'bmshj2018-finetuned',
+    }[bmshj_kind]
 
-    svd_rows   = sorted(load_csv(svd_path), key=lambda r: r['k'])
-    bmshj_rows = sorted(normalize_bmshj_rows(bmshj_kind, load_csv(bmshj_path)), key=lambda r: r['rel_err'])
+    svd_rows = sorted(load_csv(svd_path), key=lambda r: r['k'])
+    bmshj_string_cols = frozenset({'label'}) if bmshj_kind == 'finetune' else frozenset()
+    bmshj_rows = sorted(normalize_bmshj_rows(bmshj_kind, load_csv(bmshj_path, bmshj_string_cols)),
+                         key=lambda r: r['rel_err'])
 
     print(f"bmshj2018 source: {bmshj_kind} ({bmshj_path})")
     if bmshj_kind == 'scratch' and len(bmshj_rows) == 1:
         print("Note: from-scratch results are a single λ, not a sweep — plotted as one point.\n")
+    elif bmshj_kind == 'finetune':
+        print("Note: fine-tune results are 2 points (pretrained vs. fine-tuned at one quality "
+              "level), not a sweep — the connecting line just shows the before/after delta.\n")
     else:
         print()
 

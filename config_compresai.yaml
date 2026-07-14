@@ -1,10 +1,27 @@
-# Config for bmshj2018_compression.py exclusively (the pretrained CompressAI zoo baseline).
-# Only cfg['data']['h5_path'/'field_key'/'timestep'] are ever read by that script — no svd:,
-# model:, or training: sections, and no patch_size (the codec slices 2D planes on the fly,
-# sized via --axis/--batch-size CLI flags instead).
+# Config shared by bmshj2018_compression.py (inference-only, pretrained CompressAI zoo baseline)
+# and bmshj2018_finetune.py (fine-tunes those same pretrained weights on this dataset).
+# bmshj2018_compression.py reads only data.h5_path/field_key/timestep. bmshj2018_finetune.py reads
+# data.h5_path/field_key plus the finetune: section below — it ignores data.timestep entirely,
+# using finetune.train_timesteps/val_timestep instead so train and eval never overlap.
 
 data:
   #h5_path:    "/data/mldc/pde_bench/Turb_M1.hdf5"
   h5_path:     "/home/carlos/Rnet_local/datasets/pde_bench/Turb_M1.hdf5" #Alienware local
   field_key:  "pressure"
-  timestep:   40       # index into the nt dimension (0-based → physical t=16)
+  timestep:   40       # index into the nt dimension (0-based → physical t=16); bmshj2018_compression.py only
+
+finetune:
+  quality:    4          # which pretrained CompressAI checkpoint (1-8) to initialize weights from
+  metric:     "mse"      # "mse" or "ms-ssim"; only "mse" has a built-in default lambda_ table below
+  lambda_:    null       # rate-distortion weight; null -> use CompressAI's standard per-quality mse
+                          # table (quality 4 -> 0.013). Required explicitly (via --lambda_) for ms-ssim.
+  batch_size: 8
+  iterations: 2000
+  lr:         0.0001     # main (g_a/g_s) optimizer lr
+  aux_lr:     0.001      # entropy_bottleneck.quantiles optimizer lr — must stay separate, see
+                          # bmshj2018_finetune.py's configure_optimizers()
+  patch_size: 128        # 2D training crop; must be a multiple of 16 (model's downsampling factor)
+  axis:       0          # volume axis sliced into 2D planes; matches bmshj2018_compression.py's --axis
+  train_timesteps:     "0-34"  # e.g. "0-34" or a single index; held out of val_timestep
+  val_timestep:         40     # held out of training entirely, used for full-volume eval
+  slices_per_timestep:  16     # random z-slices cached per timestep for train/quick-val batches
