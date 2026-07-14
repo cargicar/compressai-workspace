@@ -7,7 +7,7 @@ svd:
 
 data:
   #h5_path:    "/data/mldc/pde_bench/Turb_M1.hdf5"
-  h5_path:             "/home/carlos/Rnet_local/datasets/pde_bench/Turb_M1.hdf5" #Alienware local
+  h5_path:     "/home/carlos/Rnet_local/datasets/pde_bench/Turb_M1.hdf5" #Alienware local
   field_key:  "pressure"
   timestep:   40       # index into the nt dimension (0-based → physical t=16)
   patch_size: 9        # 3D voxel-patch side length (P³ patches); unrelated to bmshj2018_scratch.py's

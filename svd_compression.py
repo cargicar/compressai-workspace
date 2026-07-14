@@ -31,11 +31,11 @@ here reflects both truncation (k) and quantization (bits) error.
 
 Usage
 -----
-    python svd_compression.py config_simmldc.yaml
-    python svd_compression.py config_simmldc.yaml --k-max 60
-    python svd_compression.py config_simmldc.yaml --k-values 5 10 20 50
-    python svd_compression.py config_simmldc.yaml --quant-bits 4 8 12 16
-    python svd_compression.py config_simmldc.yaml --output-dir results/svd_run1
+    python svd_compression.py config_svd.yaml
+    python svd_compression.py config_svd.yaml --k-max 60
+    python svd_compression.py config_svd.yaml --k-values 5 10 20 50
+    python svd_compression.py config_svd.yaml --quant-bits 4 8 12 16
+    python svd_compression.py config_svd.yaml --output-dir results/svd_run1
 """
 
 import argparse

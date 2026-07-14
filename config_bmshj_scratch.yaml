@@ -10,9 +10,9 @@ data:
   h5_path:             "/home/carlos/Rnet_local/datasets/pde_bench/Turb_M1.hdf5" #Alienware local
   field_key:           "pressure"
   patch_size:          128         # 2D training crop size; multiple of 16 (4 stride-2 stages)
-  train_timesteps:     "0-34"     # e.g. "0-34" or a single index; held out of val_timestep
+  train_timesteps:     "0-40"     # e.g. "0-34" or a single index; held out of val_timestep
   val_timestep:        40         # held out of training entirely, used for full-volume eval
-  slices_per_timestep: 16         # random z-slices cached per timestep for train/quick-val batches
+  slices_per_timestep: 32         # random z-slices cached per timestep for train/quick-val batches
 
 model:
   channels_n: 128   # main conv channel count (N)
@@ -22,6 +22,6 @@ training:
   lambda_:    1000.0   # rate-distortion trade-off weight (loss = lambda*MSE + bpp); see
                         # bmshj2018_scratch.py's module docstring for why this needs to be
                         # ~255^2 larger than compressai's own lambda convention
-  batch_size: 16
-  iterations: 3000
+  batch_size: 32
+  iterations: 4000
   lr:         0.0001
