@@ -3,11 +3,12 @@
 # config were for a different (LCA) pipeline and are unused here, so they've been dropped.
 
 svd:
-  backend: "numpy"    # "sklearn" (randomized_svd) or "numpy" (linalg.svd, exact but slower)
+  backend: "sklearn"    # "sklearn" (randomized_svd) or "numpy" (linalg.svd, exact but slower)
 
 data:
-  h5_path:    "/data/mldc/pde_bench/Turb_M1.hdf5"
+  #h5_path:    "/data/mldc/pde_bench/Turb_M1.hdf5"
+  h5_path:             "/home/carlos/Rnet_local/datasets/pde_bench/Turb_M1.hdf5" #Alienware local
   field_key:  "pressure"
-  timestep:   15       # index into the nt dimension (0-based → physical t=16)
+  timestep:   40       # index into the nt dimension (0-based → physical t=16)
   patch_size: 9        # 3D voxel-patch side length (P³ patches); unrelated to bmshj2018_scratch.py's
                         # 2D image crop size — see config_bmshj_scratch.yaml for that.

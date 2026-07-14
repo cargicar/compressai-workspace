@@ -6,7 +6,8 @@
 # CLI flags always override these values, e.g. `--patch-size 96` beats patch_size below.
 
 data:
-  h5_path:             "/data/mldc/pde_bench/Turb_M1.hdf5"
+  #h5_path:             "/data/mldc/pde_bench/Turb_M1.hdf5" #hyperion
+  h5_path:             "/home/carlos/Rnet_local/datasets/pde_bench/Turb_M1.hdf5" #Alienware local
   field_key:           "pressure"
   patch_size:          128         # 2D training crop size; multiple of 16 (4 stride-2 stages)
   train_timesteps:     "0-34"     # e.g. "0-34" or a single index; held out of val_timestep
@@ -14,8 +15,8 @@ data:
   slices_per_timestep: 16         # random z-slices cached per timestep for train/quick-val batches
 
 model:
-  channels_n: 64   # main conv channel count (N)
-  channels_m: 64   # latent channel count (M)
+  channels_n: 128   # main conv channel count (N)
+  channels_m: 128   # latent channel count (M)
 
 training:
   lambda_:    1000.0   # rate-distortion trade-off weight (loss = lambda*MSE + bpp); see
