@@ -23,6 +23,15 @@ unreadable mess, each run's full output is redirected to
 compresai_finetune.py already writes once its own logging is set up) — the
 console just gets concise start/finish status lines.
 
+Right after each architecture's training finishes successfully (not batched at
+the end of the whole sweep — as soon as that one run completes), this script
+also calls compare_compression.py against --svd-baseline (default
+experiments/svd_test) and saves the resulting plot into that architecture's
+own experiments/finetune_<architecture>_<timestamp>/ directory, alongside its
+finetune_results.csv/checkpoints/logs. A failure in this comparison step
+(e.g. a missing SVD baseline) only prints a warning — it does not mark the
+architecture's training itself as failed.
+
 Config
 ------
 Same config_compresai.yaml (or any config with a finetune: section) used by
@@ -36,6 +45,7 @@ Usage
     python compresai_finetune_sweep.py config_compresai.yaml --iterations 5000 --quality 6
     python compresai_finetune_sweep.py config_compresai.yaml --gpus 1 2 3   # skip GPU 0
     python compresai_finetune_sweep.py config_compresai.yaml --max-concurrent 2
+    python compresai_finetune_sweep.py config_compresai.yaml --svd-baseline experiments/svd_test
 """
 
 import argparse
@@ -68,6 +78,10 @@ def main():
     parser.add_argument("--max-concurrent", type=int, default=None,
                         help="cap on simultaneous runs (default: number of GPU slots — more "
                              "architectures than slots just queue for the next free GPU)")
+    parser.add_argument("--svd-baseline", default="experiments/svd_test",
+                        help="SVD run directory (or svd_results.csv) passed to compare_compression.py "
+                             "as the comparison baseline for each architecture, right after that "
+                             "architecture's training finishes (default: experiments/svd_test)")
     # Passthrough overrides — forwarded to compresai_finetune.py only if set, else its own
     # config-driven defaults apply (same flags it defines, see its --help for details).
     parser.add_argument("--quality", type=int, default=None, choices=range(1, 9))
@@ -97,7 +111,9 @@ def main():
 
     sweep_tag = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     os.makedirs(args.output_root, exist_ok=True)
-    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compresai_finetune.py")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(script_dir, "compresai_finetune.py")
+    compare_script_path = os.path.join(script_dir, "compare_compression.py")
 
     passthrough = [
         ("--quality", args.quality), ("--metric", args.metric), ("--lambda_", args.lambda_),
@@ -156,6 +172,18 @@ def main():
             if proc.returncode == 0:
                 run_dirs[arch] = out_dir
                 print(f"[{arch}] finished OK")
+                compare_out = os.path.join(out_dir, "compare_rate_distortion.png")
+                compare_proc = subprocess.run(
+                    [sys.executable, compare_script_path, args.svd_baseline, out_dir,
+                     "--output", compare_out],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                )
+                if compare_proc.returncode == 0:
+                    print(f"[{arch}] comparison vs {args.svd_baseline} saved to {out_dir}")
+                else:
+                    last_line = compare_proc.stdout.strip().splitlines()[-1] if compare_proc.stdout else ""
+                    print(f"[{arch}] WARNING: compare_compression.py failed (exit "
+                          f"{compare_proc.returncode}): {last_line}")
             else:
                 failed.append(arch)
                 print(f"[{arch}] FAILED (exit {proc.returncode}) — see {out_dir}/stdout.log")

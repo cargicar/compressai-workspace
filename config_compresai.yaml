@@ -7,8 +7,8 @@
 # finetune.train_timesteps/val_timestep instead so train and eval never overlap.
 
 data:
-  #h5_path:    "/data/mldc/pde_bench/Turb_M1.hdf5"
-  h5_path:     "/home/carlos/Rnet_local/datasets/pde_bench/Turb_M1.hdf5" #Alienware local
+  h5_path:    "/data/mldc/pde_bench/Turb_M1.hdf5"
+  #h5_path:     "/home/carlos/Rnet_local/datasets/pde_bench/Turb_M1.hdf5" #Alienware local
   field_key:  "pressure"
   timestep:   40       # index into the nt dimension (0-based → physical t=16); bmshj2018_compression.py only
 
@@ -22,7 +22,7 @@ finetune:
   lambda_:    null       # rate-distortion weight; null -> use CompressAI's standard per-quality mse
                           # table (quality 4 -> 0.013). Required explicitly (via --lambda_) for ms-ssim.
   batch_size: 8
-  iterations: 2000
+  iterations: 5000
   lr:         0.0001     # main (g_a/g_s) optimizer lr
   aux_lr:     0.001      # *.quantiles optimizer lr — must stay separate, see configure_optimizers()
                           # in bmshj2018_finetune.py / compresai_finetune.py
