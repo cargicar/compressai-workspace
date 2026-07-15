@@ -1,0 +1,533 @@
+"""
+Fine-tunes a pretrained CompressAI zoo model — chosen from the architectures
+defined in compressai/models/google.py — on this project's own PDEBench
+scalar-field data. Generalizes bmshj2018_finetune.py (which is hardcoded to
+bmshj2018-factorized) to any of:
+
+    bmshj2018-factorized   FactorizedPrior                  (Balle 2018, factorized prior)
+    bmshj2018-hyperprior   ScaleHyperprior                   (Balle 2018, scale hyperprior)
+    mbt2018-mean           MeanScaleHyperprior                (Minnen 2018, mean+scale hyperprior)
+    mbt2018                JointAutoregressiveHierarchicalPriors (Minnen 2018, + autoregressive context)
+
+(bmshj2018-factorized-relu is also defined in google.py but has no pretrained
+weights in the zoo — there's nothing to fine-tune from, so it's excluded here.)
+
+All four share the same pseudo-RGB 2D-slice pipeline, the same real
+entropy-coding evaluation (model.compress/decompress), and the same
+rate-distortion loss convention as bmshj2018_finetune.py. The only
+architecture-specific details handled here:
+  - `model.downsampling_factor` differs (16 for the plain factorized model,
+    64 for the three hyperprior-based ones, since they downsample the side
+    information z an extra 2x) — patch_size is validated against it.
+  - `out_enc["strings"]` has 1 entry (y) for bmshj2018-factorized but 2
+    (y and z) for the hyperprior-based models — byte counting sums over all
+    of them, not just strings[0].
+
+Config
+------
+Use `config_compresai.yaml`'s `finetune:` section, same fields as
+bmshj2018_finetune.py plus `architecture`. CLI flags override the config
+value they correspond to.
+
+Usage
+-----
+    python compresai_finetune.py config_compresai.yaml
+    python compresai_finetune.py config_compresai.yaml --architecture mbt2018-mean
+    python compresai_finetune.py config_compresai.yaml --architecture mbt2018 --quality 6 --iterations 5000
+    python compresai_finetune.py config_compresai.yaml --architecture bmshj2018-hyperprior --lambda_ 0.02
+"""
+
+import argparse
+import builtins
+import csv
+import os
+import shutil
+from datetime import datetime
+
+import h5py
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+import yaml
+
+from compressai.ops import compute_padding
+from compressai.zoo import bmshj2018_factorized, bmshj2018_hyperprior, mbt2018, mbt2018_mean
+
+# Architectures defined in compressai/models/google.py that ship pretrained zoo
+# weights (bmshj2018-factorized-relu is also in google.py but has none, so it's
+# excluded — there'd be nothing to fine-tune from).
+ARCHITECTURES = {
+    "bmshj2018-factorized": bmshj2018_factorized,
+    "bmshj2018-hyperprior": bmshj2018_hyperprior,
+    "mbt2018-mean": mbt2018_mean,
+    "mbt2018": mbt2018,
+}
+
+# model.downsampling_factor per architecture (see google.py's ScaleHyperprior/
+# FactorizedPrior classes) — the hyperprior-based ones downsample the side
+# information z an extra 2x beyond the main y path.
+DOWNSAMPLING_FACTORS = {
+    "bmshj2018-factorized": 16,
+    "bmshj2018-hyperprior": 64,
+    "mbt2018-mean": 64,
+    "mbt2018": 64,
+}
+
+# CompressAI's commonly-cited per-quality lambda values for the "mse" metric,
+# the same convention across all four architectures above. ms-ssim uses a
+# different, unpublished-here scale — pass --lambda_ explicitly for it.
+STANDARD_MSE_LAMBDAS = {
+    1: 0.0018, 2: 0.0035, 3: 0.0067, 4: 0.0130,
+    5: 0.0250, 6: 0.0483, 7: 0.0932, 8: 0.1800,
+}
+
+
+# ---------------------------------------------------------------------------
+# PDEBench slice data (same convention as bmshj2018_scratch.py / bmshj2018_finetune.py)
+# ---------------------------------------------------------------------------
+
+def load_slice_cache(h5_path: str, field: str, timesteps: list, slices_per_timestep: int,
+                      rng: np.random.Generator) -> np.ndarray:
+    """Random (Y,Z) slices (axis 0) for each t in timesteps -> (n_slices, H, W)."""
+    slices = []
+    with h5py.File(h5_path, "r") as f:
+        dset = f[field]
+        n_slices_avail = dset.shape[1]
+        for t in timesteps:
+            idxs = rng.choice(n_slices_avail, size=min(slices_per_timestep, n_slices_avail), replace=False)
+            for idx in sorted(idxs.tolist()):
+                slices.append(dset[t, idx].astype(np.float32))
+    return np.stack(slices, axis=0)
+
+
+def sample_batch_rgb(cache: np.ndarray, patch_size: int, batch_size: int,
+                      rng: np.random.Generator, device: str) -> torch.Tensor:
+    """Random patch_size x patch_size crops, replicated to pseudo-RGB -> (B, 3, P, P)."""
+    n, H, W = cache.shape
+    batch = np.empty((batch_size, patch_size, patch_size), dtype=np.float32)
+    for i in range(batch_size):
+        idx = rng.integers(n)
+        y0 = rng.integers(0, H - patch_size + 1)
+        x0 = rng.integers(0, W - patch_size + 1)
+        batch[i] = cache[idx, y0:y0 + patch_size, x0:x0 + patch_size]
+    x = torch.from_numpy(batch).unsqueeze(1).to(device)
+    return x.repeat(1, 3, 1, 1)
+
+
+def load_full_volume(h5_path: str, field: str, timestep: int) -> np.ndarray:
+    with h5py.File(h5_path, "r") as f:
+        return f[field][timestep].astype(np.float32)
+
+
+def parse_timestep_range(s) -> list:
+    s = str(s)
+    if "-" in s:
+        lo, hi = s.split("-")
+        return list(range(int(lo), int(hi) + 1))
+    return [int(s)]
+
+
+# ---------------------------------------------------------------------------
+# Metrics (same formulas as bmshj2018_compression.py / svd_compression.py)
+# ---------------------------------------------------------------------------
+
+def compute_metrics(input_vol: np.ndarray, recon_vol: np.ndarray, n_bytes: int, n_voxels: int) -> dict:
+    error = input_vol - recon_vol
+    mse = float((error ** 2).mean())
+    rmse = float(np.sqrt(mse))
+    rel_err = float(np.sqrt(mse) / (np.sqrt((input_vol ** 2).mean()) + 1e-8))
+    sig_range = float(input_vol.max() - input_vol.min())
+    psnr = float(20 * np.log10(sig_range / (rmse + 1e-12)))
+
+    bytes_in = n_voxels * 4
+    comp_ratio = bytes_in / n_bytes if n_bytes > 0 else float("inf")
+    bpv = (n_bytes * 8) / n_voxels
+    return dict(rel_err=rel_err, rmse=rmse, psnr=psnr, comp_ratio=comp_ratio, bpv=bpv, n_bytes=n_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Real entropy-coded full-volume compress/decompress — architecture-agnostic:
+# out_enc["strings"] is [y_strings] for bmshj2018-factorized but
+# [y_strings, z_strings] for the hyperprior-based models, so bytes are summed
+# over every string list, not just strings[0].
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compress_volume(vol01: np.ndarray, model, device: str, axis: int, batch_size: int):
+    slices = np.moveaxis(vol01, axis, 0)
+    N, H, W = slices.shape
+    pad, unpad = compute_padding(H, W, min_div=64)
+
+    recon_slices = np.empty_like(slices)
+    total_bytes = 0
+    for start in range(0, N, batch_size):
+        batch = slices[start:start + batch_size]
+        x = torch.from_numpy(batch).unsqueeze(1).to(device)
+        x = x.repeat(1, 3, 1, 1)
+        x = F.pad(x, pad, mode="constant", value=0)
+        out_enc = model.compress(x)
+        total_bytes += sum(len(s) for string_list in out_enc["strings"] for s in string_list)
+        out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
+        x_hat = F.pad(out_dec["x_hat"], unpad)
+        rec = x_hat.mean(dim=1).clamp(0, 1).cpu().numpy()
+        recon_slices[start:start + batch.shape[0]] = rec
+
+    return np.moveaxis(recon_slices, 0, axis), total_bytes
+
+
+# ---------------------------------------------------------------------------
+# Optimizers — main params vs. *.quantiles (CompressAI convention). All four
+# architectures have exactly one EntropyBottleneck (over z for the hyperprior
+# models, over y directly for bmshj2018-factorized), so this split generalizes
+# unchanged.
+# ---------------------------------------------------------------------------
+
+def configure_optimizers(model, lr: float, aux_lr: float):
+    params_dict = dict(model.named_parameters())
+    main_names = sorted(n for n, p in params_dict.items() if p.requires_grad and not n.endswith(".quantiles"))
+    aux_names = sorted(n for n, p in params_dict.items() if p.requires_grad and n.endswith(".quantiles"))
+    optimizer = torch.optim.Adam((params_dict[n] for n in main_names), lr=lr)
+    aux_optimizer = torch.optim.Adam((params_dict[n] for n in aux_names), lr=aux_lr)
+    return optimizer, aux_optimizer
+
+
+# ---------------------------------------------------------------------------
+# Train
+# ---------------------------------------------------------------------------
+
+def train(model, train_cache, val_cache, args, device):
+    optimizer, aux_optimizer = configure_optimizers(model, args.lr, args.aux_lr)
+    rng = np.random.default_rng(0)
+
+    history = {"iter": [], "loss": [], "bpp": [], "mse": [], "psnr": []}
+    val_history = {"iter": [], "loss": [], "bpp": [], "psnr": []}
+
+    model.train()
+    for it in range(1, args.iterations + 1):
+        x = sample_batch_rgb(train_cache, args.patch_size, args.batch_size, rng, device)
+
+        out = model(x)
+        num_pixels = x.size(0) * x.size(2) * x.size(3)
+        bpp = sum(-torch.log2(lk).sum() for lk in out["likelihoods"].values()) / num_pixels
+        mse = F.mse_loss(out["x_hat"], x)
+        loss = args.lambda_ * 255 ** 2 * mse + bpp
+
+        optimizer.zero_grad()
+        aux_optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        aux_loss = model.aux_loss()
+        aux_loss.backward()
+        aux_optimizer.step()
+
+        if it % 50 == 0 or it == 1:
+            psnr = float(20 * np.log10(1.0 / (np.sqrt(mse.item()) + 1e-12)))
+            history["iter"].append(it)
+            history["loss"].append(loss.item())
+            history["bpp"].append(bpp.item())
+            history["mse"].append(mse.item())
+            history["psnr"].append(psnr)
+            print(f"iter {it:>6}/{args.iterations}  loss={loss.item():.4f}  "
+                  f"bpp={bpp.item():.4f}  mse={mse.item():.6f}  psnr={psnr:.2f}dB  "
+                  f"aux_loss={aux_loss.item():.2f}")
+
+        if it % 500 == 0:
+            model.eval()
+            with torch.no_grad():
+                xv = sample_batch_rgb(val_cache, args.patch_size, args.batch_size, rng, device)
+                out_v = model(xv)
+                v_pixels = xv.size(0) * xv.size(2) * xv.size(3)
+                v_bpp = sum(-torch.log2(lk).sum() for lk in out_v["likelihoods"].values()) / v_pixels
+                v_mse = F.mse_loss(out_v["x_hat"], xv)
+                v_loss = args.lambda_ * 255 ** 2 * v_mse + v_bpp
+                v_psnr = float(20 * np.log10(1.0 / (np.sqrt(v_mse.item()) + 1e-12)))
+            val_history["iter"].append(it)
+            val_history["loss"].append(v_loss.item())
+            val_history["bpp"].append(v_bpp.item())
+            val_history["psnr"].append(v_psnr)
+            print(f"  [val] iter {it:>6}  loss={v_loss.item():.4f}  "
+                  f"bpp={v_bpp.item():.4f}  psnr={v_psnr:.2f}dB")
+            model.train()
+
+    return history, val_history
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fine-tune a pretrained compressai/models/google.py architecture on PDEBench data")
+    parser.add_argument("config", help="path to config_compresai.yaml (or another config with a finetune: section)")
+    parser.add_argument("--architecture", choices=sorted(ARCHITECTURES), default=None,
+                        help="which google.py architecture to fine-tune (default: config's finetune.architecture, "
+                             "falling back to bmshj2018-factorized)")
+    parser.add_argument("--quality", type=int, default=None, choices=range(1, 9),
+                        help="pretrained checkpoint (1-8) to initialize from (default: config's finetune.quality)")
+    parser.add_argument("--metric", choices=["mse", "ms-ssim"], default=None,
+                        help="which pretrained checkpoint family (default: config's finetune.metric)")
+    parser.add_argument("--lambda_", type=float, default=None,
+                        help="rate-distortion weight (default: config's finetune.lambda_, falling back to "
+                             "CompressAI's standard mse table by quality; required for ms-ssim)")
+    parser.add_argument("--patch-size", type=int, default=None,
+                        help="training crop size, must be a multiple of the chosen architecture's "
+                             "downsampling factor (default: config's finetune.patch_size)")
+    parser.add_argument("--batch-size", type=int, default=None, help="default: config's finetune.batch_size")
+    parser.add_argument("--iterations", type=int, default=None, help="default: config's finetune.iterations")
+    parser.add_argument("--lr", type=float, default=None, help="main optimizer lr (default: config's finetune.lr)")
+    parser.add_argument("--aux-lr", type=float, default=None,
+                        help="*.quantiles optimizer lr (default: config's finetune.aux_lr)")
+    parser.add_argument("--axis", type=int, default=None, choices=[0, 1, 2],
+                        help="volume axis sliced into 2D planes (default: config's finetune.axis)")
+    parser.add_argument("--train-timesteps", default=None, help="default: config's finetune.train_timesteps")
+    parser.add_argument("--val-timestep", type=int, default=None, help="default: config's finetune.val_timestep")
+    parser.add_argument("--slices-per-timestep", type=int, default=None,
+                        help="default: config's finetune.slices_per_timestep")
+    parser.add_argument("--device", default=None, help="cuda / cpu (default: cuda if available)")
+    parser.add_argument("--output-dir", default=None, help="default: experiments/compresai_finetune_TIMESTAMP")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    dcfg = cfg["data"]
+    fcfg = cfg.get("finetune", {})
+
+    if args.architecture is None:
+        args.architecture = fcfg.get("architecture", "bmshj2018-factorized")
+    if args.quality is None:
+        args.quality = fcfg.get("quality", 4)
+    if args.metric is None:
+        args.metric = fcfg.get("metric", "mse")
+    if args.lambda_ is None:
+        args.lambda_ = fcfg.get("lambda_")
+    if args.lambda_ is None:
+        if args.metric != "mse":
+            raise ValueError("No default lambda_ table for ms-ssim — pass --lambda_ explicitly "
+                              "(or set finetune.lambda_ in the config).")
+        args.lambda_ = STANDARD_MSE_LAMBDAS[args.quality]
+    if args.patch_size is None:
+        args.patch_size = fcfg.get("patch_size", 128)
+    if args.batch_size is None:
+        args.batch_size = fcfg.get("batch_size", 8)
+    if args.iterations is None:
+        args.iterations = fcfg.get("iterations", 2000)
+    if args.lr is None:
+        args.lr = fcfg.get("lr", 1e-4)
+    if args.aux_lr is None:
+        args.aux_lr = fcfg.get("aux_lr", 1e-3)
+    if args.axis is None:
+        args.axis = fcfg.get("axis", 0)
+    if args.train_timesteps is None:
+        args.train_timesteps = fcfg.get("train_timesteps", "0-34")
+    if args.val_timestep is None:
+        args.val_timestep = fcfg.get("val_timestep", 40)
+    if args.slices_per_timestep is None:
+        args.slices_per_timestep = fcfg.get("slices_per_timestep", 16)
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    build_model = ARCHITECTURES[args.architecture]
+    downsampling_factor = DOWNSAMPLING_FACTORS[args.architecture]
+    if args.patch_size % downsampling_factor != 0:
+        raise ValueError(f"patch_size={args.patch_size} must be a multiple of {args.architecture}'s "
+                          f"downsampling factor ({downsampling_factor}).")
+
+    out_dir = args.output_dir or os.path.join(
+        "experiments", "compresai_finetune_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    )
+    plots_dir = os.path.join(out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    shutil.copy(args.config, os.path.join(out_dir, os.path.basename(args.config)))
+
+    log_path = os.path.join(out_dir, "run.log")
+    _log = open(log_path, "w")
+    _builtin_print = builtins.print
+
+    def print(*a, **kw):
+        _builtin_print(*a, **kw)
+        kw.pop("file", None)
+        _builtin_print(*a, file=_log, **kw)
+        _log.flush()
+
+    print(f"Output dir   : {out_dir}")
+    print(f"Config       : {args.config}")
+    print(f"Device       : {device}")
+    print(f"Architecture : {args.architecture}")
+    print(f"Init from    : {args.architecture} quality={args.quality} metric={args.metric} (pretrained)")
+    print(f"Lambda       : {args.lambda_:g}")
+    print(f"Patch size   : {args.patch_size}  (downsampling factor: {downsampling_factor})")
+    print(f"Batch size   : {args.batch_size}")
+    print(f"Iterations   : {args.iterations}")
+    print(f"LR / aux LR  : {args.lr:g} / {args.aux_lr:g}")
+    print(f"Axis         : {args.axis}\n")
+
+    train_timesteps = parse_timestep_range(args.train_timesteps)
+    print(f"Train timesteps : {train_timesteps[0]}-{train_timesteps[-1]} ({len(train_timesteps)} steps)")
+    print(f"Val timestep    : {args.val_timestep} (held out of training)\n")
+
+    # ------------------------------------------------------------------ #
+    # Data
+    # ------------------------------------------------------------------ #
+    field = dcfg["field_key"]
+    rng = np.random.default_rng(42)
+    print("Loading training slice cache ...")
+    train_cache_raw = load_slice_cache(dcfg["h5_path"], field, train_timesteps,
+                                        args.slices_per_timestep, rng)
+    print(f"Train cache: {train_cache_raw.shape}  ({train_cache_raw.nbytes/1024/1024:.1f} MB)")
+
+    print("Loading validation slice cache (quick, held-out timestep) ...")
+    val_cache_raw = load_slice_cache(dcfg["h5_path"], field, [args.val_timestep],
+                                      args.slices_per_timestep, rng)
+    print(f"Val cache  : {val_cache_raw.shape}  ({val_cache_raw.nbytes/1024/1024:.1f} MB)\n")
+
+    vmin, vmax = float(train_cache_raw.min()), float(train_cache_raw.max())
+    print(f"Normalization (from training cache): vmin={vmin:.4f}  vmax={vmax:.4f}\n")
+    train_cache = (train_cache_raw - vmin) / (vmax - vmin + 1e-8)
+    val_cache = (val_cache_raw - vmin) / (vmax - vmin + 1e-8)
+
+    full_vol = load_full_volume(dcfg["h5_path"], field, args.val_timestep)
+    full_vol01 = (full_vol - vmin) / (vmax - vmin + 1e-8)
+    n_voxels = full_vol.size
+
+    # ------------------------------------------------------------------ #
+    # Baseline — pretrained model, no fine-tuning, on the held-out volume
+    # ------------------------------------------------------------------ #
+    print(f"Evaluating pretrained {args.architecture} baseline (no fine-tuning) on held-out volume ...")
+    baseline_model = build_model(quality=args.quality, metric=args.metric, pretrained=True)
+    baseline_model = baseline_model.to(device).eval()
+    baseline_model.update(force=True)
+    base_recon01, base_bytes = compress_volume(full_vol01, baseline_model, device, args.axis, args.batch_size)
+    base_recon = base_recon01 * (vmax - vmin) + vmin
+    base_metrics = compute_metrics(full_vol, base_recon, base_bytes, n_voxels)
+    print(f"  baseline  rel_err={base_metrics['rel_err']:.6f}  PSNR={base_metrics['psnr']:.2f}dB  "
+          f"comp={base_metrics['comp_ratio']:.2f}x  BPV={base_metrics['bpv']:.4f}\n")
+    del baseline_model
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------ #
+    # Fine-tune
+    # ------------------------------------------------------------------ #
+    print(f"Loading pretrained {args.architecture} quality={args.quality} metric={args.metric} ...")
+    model = build_model(quality=args.quality, metric=args.metric, pretrained=True)
+    model = model.to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {n_params:,}\n")
+
+    print("Fine-tuning ...")
+    history, val_history = train(model, train_cache, val_cache, args, device)
+    print("\nFine-tuning done.\n")
+
+    # ------------------------------------------------------------------ #
+    # Plot 1 — training curves
+    # ------------------------------------------------------------------ #
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].plot(history["iter"], history["loss"], color="steelblue", label="train")
+    axes[0].plot(val_history["iter"], val_history["loss"], color="darkorange", label="val")
+    axes[0].set_xlabel("iteration"); axes[0].set_ylabel("loss"); axes[0].set_title("Loss")
+    axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(history["iter"], history["bpp"], color="steelblue", label="train")
+    axes[1].plot(val_history["iter"], val_history["bpp"], color="darkorange", label="val")
+    axes[1].set_xlabel("iteration"); axes[1].set_ylabel("bpp (entropy estimate)"); axes[1].set_title("Rate")
+    axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(history["iter"], history["psnr"], color="steelblue", label="train")
+    axes[2].plot(val_history["iter"], val_history["psnr"], color="darkorange", label="val")
+    axes[2].set_xlabel("iteration"); axes[2].set_ylabel("PSNR (dB)"); axes[2].set_title("Distortion")
+    axes[2].legend(fontsize=8); axes[2].grid(True, alpha=0.3)
+
+    fig.suptitle(f"{args.architecture} fine-tune  quality={args.quality} lambda={args.lambda_:g}", fontsize=10)
+    plt.tight_layout()
+    out = os.path.join(plots_dir, "training_curves.png")
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+    # ------------------------------------------------------------------ #
+    # Real entropy-coded eval on the held-out volume
+    # ------------------------------------------------------------------ #
+    model.update(force=True)
+    model.eval()
+    print(f"\nEvaluating fine-tuned model on full held-out volume (t={args.val_timestep}) ...")
+    ft_recon01, ft_bytes = compress_volume(full_vol01, model, device, args.axis, args.batch_size)
+    ft_recon = ft_recon01 * (vmax - vmin) + vmin
+    ft_metrics = compute_metrics(full_vol, ft_recon, ft_bytes, n_voxels)
+
+    print(f"  pretrained  rel_err={base_metrics['rel_err']:.6f}  PSNR={base_metrics['psnr']:.2f}dB  "
+          f"comp={base_metrics['comp_ratio']:.2f}x  BPV={base_metrics['bpv']:.4f}")
+    print(f"  fine-tuned  rel_err={ft_metrics['rel_err']:.6f}  PSNR={ft_metrics['psnr']:.2f}dB  "
+          f"comp={ft_metrics['comp_ratio']:.2f}x  BPV={ft_metrics['bpv']:.4f}")
+
+    # ------------------------------------------------------------------ #
+    # Plot 2 — full-volume reconstruction: input vs pretrained vs fine-tuned
+    # ------------------------------------------------------------------ #
+    D, H, W = full_vol.shape
+    mD, mH, mW = D // 2, H // 2, W // 2
+    plane_defs = [
+        ("XY (z=mid)", full_vol[:, :, mW], base_recon[:, :, mW], ft_recon[:, :, mW]),
+        ("XZ (y=mid)", full_vol[:, mH, :], base_recon[:, mH, :], ft_recon[:, mH, :]),
+        ("YZ (x=mid)", full_vol[mD, :, :], base_recon[mD, :, :], ft_recon[mD, :, :]),
+    ]
+    fig, axes = plt.subplots(3, 3, figsize=(14, 13))
+    fig.suptitle(
+        f"{args.architecture}  quality={args.quality}  lambda={args.lambda_:g}  |  "
+        f"pretrained rel_err={base_metrics['rel_err']:.4f} BPV={base_metrics['bpv']:.4f}  vs.  "
+        f"fine-tuned rel_err={ft_metrics['rel_err']:.4f} BPV={ft_metrics['bpv']:.4f}",
+        fontsize=10,
+    )
+    for col, (lbl, inp_p, base_p, ft_p) in enumerate(plane_defs):
+        vmax_p = np.percentile(np.abs(inp_p), 99)
+        for row, (data, row_lbl) in enumerate([(inp_p, "Input"), (base_p, "Pretrained"), (ft_p, "Fine-tuned")]):
+            ax = axes[row, col]
+            im = ax.imshow(data, cmap="RdBu_r", vmin=-vmax_p, vmax=vmax_p, origin="lower", aspect="equal")
+            if row == 0:
+                ax.set_title(lbl, fontsize=9)
+            if col == 0:
+                ax.set_ylabel(row_lbl, fontsize=9)
+            ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+            plt.colorbar(im, ax=ax, shrink=0.85)
+    plt.tight_layout()
+    out = os.path.join(plots_dir, "full_volume_reconstruction.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {out}")
+
+    # ------------------------------------------------------------------ #
+    # Results CSV + checkpoint
+    # ------------------------------------------------------------------ #
+    csv_path = os.path.join(out_dir, "finetune_results.csv")
+    rows = [
+        dict(label="pretrained", architecture=args.architecture, quality=args.quality,
+             lambda_=args.lambda_, iterations=0, **base_metrics),
+        dict(label="finetuned", architecture=args.architecture, quality=args.quality,
+             lambda_=args.lambda_, iterations=args.iterations, **ft_metrics),
+    ]
+    with open(csv_path, "w", newline="") as csvf:
+        writer = csv.DictWriter(csvf, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\nResults table saved to {csv_path}")
+
+    ckpt_path = os.path.join(out_dir, "model_finetuned.pt")
+    torch.save({"model_state": model.state_dict(), "vmin": vmin, "vmax": vmax,
+                "architecture": args.architecture, "quality": args.quality, "metric": args.metric,
+                "args": vars(args)}, ckpt_path)
+    print(f"Checkpoint saved to {ckpt_path}")
+
+    print(f"\n{'='*60}")
+    print(f"{args.architecture} FINE-TUNE SUMMARY")
+    print(f"{'='*60}")
+    print(f"Volume:      {D}×{H}×{W}")
+    print(f"Pretrained:  rel_err={base_metrics['rel_err']:.4f}  comp={base_metrics['comp_ratio']:.2f}x  "
+          f"BPV={base_metrics['bpv']:.4f}")
+    print(f"Fine-tuned:  rel_err={ft_metrics['rel_err']:.4f}  comp={ft_metrics['comp_ratio']:.2f}x  "
+          f"BPV={ft_metrics['bpv']:.4f}")
+    print("\nDone.")
+    _log.close()
+
+
+if __name__ == "__main__":
+    main()

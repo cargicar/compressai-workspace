@@ -1,8 +1,10 @@
-# Config shared by bmshj2018_compression.py (inference-only, pretrained CompressAI zoo baseline)
-# and bmshj2018_finetune.py (fine-tunes those same pretrained weights on this dataset).
-# bmshj2018_compression.py reads only data.h5_path/field_key/timestep. bmshj2018_finetune.py reads
-# data.h5_path/field_key plus the finetune: section below — it ignores data.timestep entirely,
-# using finetune.train_timesteps/val_timestep instead so train and eval never overlap.
+# Config shared by bmshj2018_compression.py (inference-only, pretrained CompressAI zoo baseline),
+# bmshj2018_finetune.py (fine-tunes the bmshj2018-factorized pretrained weights on this dataset),
+# and compresai_finetune.py (same fine-tuning, but choose any compressai/models/google.py
+# architecture via finetune.architecture). bmshj2018_compression.py reads only
+# data.h5_path/field_key/timestep. The two finetune scripts read data.h5_path/field_key plus the
+# finetune: section below — they ignore data.timestep entirely, using
+# finetune.train_timesteps/val_timestep instead so train and eval never overlap.
 
 data:
   #h5_path:    "/data/mldc/pde_bench/Turb_M1.hdf5"
@@ -11,6 +13,10 @@ data:
   timestep:   40       # index into the nt dimension (0-based → physical t=16); bmshj2018_compression.py only
 
 finetune:
+  architecture: "bmshj2018-factorized"  # compresai_finetune.py only; one of bmshj2018-factorized,
+                                         # bmshj2018-hyperprior, mbt2018-mean, mbt2018 (the
+                                         # google.py architectures with pretrained zoo weights).
+                                         # bmshj2018_finetune.py ignores this — always factorized.
   quality:    4          # which pretrained CompressAI checkpoint (1-8) to initialize weights from
   metric:     "mse"      # "mse" or "ms-ssim"; only "mse" has a built-in default lambda_ table below
   lambda_:    null       # rate-distortion weight; null -> use CompressAI's standard per-quality mse
@@ -18,9 +24,10 @@ finetune:
   batch_size: 8
   iterations: 2000
   lr:         0.0001     # main (g_a/g_s) optimizer lr
-  aux_lr:     0.001      # entropy_bottleneck.quantiles optimizer lr — must stay separate, see
-                          # bmshj2018_finetune.py's configure_optimizers()
-  patch_size: 128        # 2D training crop; must be a multiple of 16 (model's downsampling factor)
+  aux_lr:     0.001      # *.quantiles optimizer lr — must stay separate, see configure_optimizers()
+                          # in bmshj2018_finetune.py / compresai_finetune.py
+  patch_size: 128        # 2D training crop; must be a multiple of the architecture's downsampling
+                          # factor (16 for bmshj2018-factorized, 64 for the hyperprior-based ones)
   axis:       0          # volume axis sliced into 2D planes; matches bmshj2018_compression.py's --axis
   train_timesteps:     "0-34"  # e.g. "0-34" or a single index; held out of val_timestep
   val_timestep:         40     # held out of training entirely, used for full-volume eval
